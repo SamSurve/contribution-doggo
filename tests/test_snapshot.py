@@ -9,6 +9,7 @@ Comprehensive unit tests for snapshot engine:
 - Calendar year transition / baseline advancement prevention
 """
 import json
+import os
 import pytest
 from pathlib import Path
 from src.snapshot import (
@@ -295,51 +296,329 @@ def test_empty_grid_refuses_snapshot_advancement(tmp_path):
     assert not snap_file.exists()
 
 
-def test_transactional_recovery_preserves_old_gif_on_failure(tmp_path, monkeypatch):
+def test_custom_test_snapshot_cannot_contaminate_production_files(tmp_path):
     """
-    Transactional recovery: if snapshot saving fails after GIF generation,
-    the old GIF must be preserved/restored, and the backup file cleaned up.
+    FIX 1 REGRESSION: Custom test snapshot destinations must NEVER create,
+    replace, or modify production files at data/ or dist/.
     """
-    import doggo
+    from src.snapshot import DIST_SNAPSHOT, SNAPSHOT_FILE
 
-    test_out = tmp_path / "test_doggo.gif"
-    # Create an initial valid existing GIF
-    test_out.write_bytes(b"ORIGINAL_VALID_GIF_BYTES_12345")
-    backup_file = test_out.with_suffix(".gif.bak")
+    # Capture original production states if files exist
+    prod_data_exists = SNAPSHOT_FILE.is_file()
+    prod_dist_exists = DIST_SNAPSHOT.is_file()
+    orig_data_bytes = SNAPSHOT_FILE.read_bytes() if prod_data_exists else None
+    orig_dist_bytes = DIST_SNAPSHOT.read_bytes() if prod_dist_exists else None
 
-    monkeypatch.setattr(doggo, "OUTPUT_PATH", str(test_out))
-
-    # Mock fetch_contributions to return valid data
-    from src.fetcher import ContributionResult
-    sample_grid = {
-        (0, 0): {"date": "2026-11-01", "row": 0, "col": 0, "count": 1, "commit_count": 1, "level": 1}
+    custom_dest = tmp_path / "isolated_test_snapshot.json"
+    grid = {
+        (0, 0): {"date": "2026-11-01", "row": 0, "col": 0, "count": 999, "commit_count": 999, "level": 4}
     }
+
+    # Save to custom destination
+    save_snapshot(grid, 999, username="IsolatedTestUser", destination=custom_dest)
+
+    # 1. Custom destination was written
+    assert custom_dest.is_file()
+    assert '"IsolatedTestUser"' in custom_dest.read_text(encoding="utf-8")
+
+    # 2. Production data snapshot must be completely untouched
+    if prod_data_exists:
+        assert SNAPSHOT_FILE.read_bytes() == orig_data_bytes
+    else:
+        assert not SNAPSHOT_FILE.is_file()
+
+    # 3. Production dist snapshot must be completely untouched (no auto-mirroring)
+    if prod_dist_exists:
+        assert DIST_SNAPSHOT.read_bytes() == orig_dist_bytes
+    else:
+        assert not DIST_SNAPSHOT.is_file()
+
+    # 4. load_previous_snapshot() without custom path must NOT load test snapshot
+    default_loaded = load_previous_snapshot()
+    if default_loaded:
+        assert default_loaded.get("username") != "IsolatedTestUser"
+
+
+def _setup_isolated_workspace(tmp_path):
+    """Helper to set up isolated GIF and snapshot files for transactional testing."""
+    test_gif = tmp_path / "contribution-doggo.gif"
+    test_data = tmp_path / "data" / "contributions_snapshot.json"
+    test_dist = tmp_path / "dist" / "contributions_snapshot.json"
+
+    test_gif.parent.mkdir(parents=True, exist_ok=True)
+    test_data.parent.mkdir(parents=True, exist_ok=True)
+    test_dist.parent.mkdir(parents=True, exist_ok=True)
+
+    gif_bytes = b"ORIGINAL_VALID_GIF_BYTES_1234567890"
+    data_bytes = b'{"original": "data_snapshot_bytes"}'
+    dist_bytes = b'{"original": "dist_snapshot_bytes"}'
+
+    test_gif.write_bytes(gif_bytes)
+    test_data.write_bytes(data_bytes)
+    test_dist.write_bytes(dist_bytes)
+
+    return test_gif, test_data, test_dist, gif_bytes, data_bytes, dist_bytes
+
+
+def _mock_valid_render_gif(**kwargs):
+    from PIL import Image as PILImage
+    out_p = kwargs["output_path"]
+    frames = [PILImage.new("RGB", (10, 10), (i * 10, i * 10, 0)) for i in range(15)]
+    frames[0].save(out_p, format="GIF", save_all=True, append_images=frames[1:], duration=100, loop=0)
+
+
+def test_transactional_rollback_on_gif_rendering_failure(tmp_path, monkeypatch):
+    """Rollback test: failure during GIF rendering preserves all original files."""
+    import doggo
+    test_gif, test_data, test_dist, orig_gif, orig_data, orig_dist = _setup_isolated_workspace(tmp_path)
+
+    monkeypatch.setattr(doggo, "OUTPUT_PATH", str(test_gif))
+    monkeypatch.setenv("SNAPSHOT_PATH", str(test_data))
+    monkeypatch.setenv("DIST_SNAPSHOT_PATH", str(test_dist))
+
+    from src.fetcher import ContributionResult
+    sample_grid = {(0, 0): {"date": "2026-11-01", "row": 0, "col": 0, "count": 1, "commit_count": 1, "level": 1}}
     monkeypatch.setattr(
-        doggo,
-        "fetch_contributions",
+        doggo, "fetch_contributions",
         lambda *args, **kwargs: ContributionResult(sample_grid, list(sample_grid.values()), 1, None, True)
     )
 
-    # Simulate render_gif writing a dummy valid GIF
-    from PIL import Image as PILImage
-    def mock_render_gif(**kwargs):
-        out_p = kwargs["output_path"]
-        img = PILImage.new("RGB", (10, 10), color="blue")
-        frames = [img.copy() for _ in range(12)]
-        frames[0].save(out_p, save_all=True, append_images=frames[1:])
+    def failing_render(**kwargs):
+        raise RuntimeError("Simulated render engine crash")
 
-    monkeypatch.setattr(doggo, "render_gif", mock_render_gif)
+    monkeypatch.setattr(doggo, "render_gif", failing_render)
 
-    # Force save_snapshot to fail (simulating disk/permission/validation error)
-    def failing_save_snapshot(*args, **kwargs):
-        raise OSError("Simulated disk error during save_snapshot")
-
-    monkeypatch.setattr(doggo, "save_snapshot", failing_save_snapshot)
-
-    # Run main() -> must exit with code 1
     exit_code = doggo.main()
     assert exit_code == 1
 
-    # ORIGINAL GIF MUST BE RESTORED!
-    assert test_out.exists()
-    assert test_out.read_bytes() == b"ORIGINAL_VALID_GIF_BYTES_12345"
+    # Byte-for-byte identical verification
+    assert test_gif.read_bytes() == orig_gif
+    assert test_data.read_bytes() == orig_data
+    assert test_dist.read_bytes() == orig_dist
+
+    # No leftover temporary or backup files
+    for f in tmp_path.glob("**/*"):
+        assert not f.name.endswith(".tmp")
+        assert not f.name.endswith(".tmp.gif")
+        assert not f.name.endswith(".bak")
+
+
+def test_transactional_rollback_on_snapshot_staging_failure(tmp_path, monkeypatch):
+    """Rollback test: failure during snapshot staging restores all original files."""
+    import doggo
+    test_gif, test_data, test_dist, orig_gif, orig_data, orig_dist = _setup_isolated_workspace(tmp_path)
+
+    monkeypatch.setattr(doggo, "OUTPUT_PATH", str(test_gif))
+    monkeypatch.setenv("SNAPSHOT_PATH", str(test_data))
+    monkeypatch.setenv("DIST_SNAPSHOT_PATH", str(test_dist))
+
+    from src.fetcher import ContributionResult
+    sample_grid = {(0, 0): {"date": "2026-11-01", "row": 0, "col": 0, "count": 1, "commit_count": 1, "level": 1}}
+    monkeypatch.setattr(
+        doggo, "fetch_contributions",
+        lambda *args, **kwargs: ContributionResult(sample_grid, list(sample_grid.values()), 1, None, True)
+    )
+    monkeypatch.setattr(doggo, "render_gif", _mock_valid_render_gif)
+
+    def failing_stage(*args, **kwargs):
+        raise RuntimeError("Simulated staging memory serialization failure")
+
+    monkeypatch.setattr(doggo, "stage_snapshot_data", failing_stage)
+
+    exit_code = doggo.main()
+    assert exit_code == 1
+
+    assert test_gif.read_bytes() == orig_gif
+    assert test_data.read_bytes() == orig_data
+    assert test_dist.read_bytes() == orig_dist
+
+    for f in tmp_path.glob("**/*"):
+        assert not f.name.endswith(".tmp")
+        assert not f.name.endswith(".tmp.gif")
+        assert not f.name.endswith(".bak")
+
+
+def test_transactional_rollback_on_gif_promotion_failure(tmp_path, monkeypatch):
+    """Rollback test: failure when promoting GIF replaces/restores original state."""
+    import doggo
+    test_gif, test_data, test_dist, orig_gif, orig_data, orig_dist = _setup_isolated_workspace(tmp_path)
+
+    monkeypatch.setattr(doggo, "OUTPUT_PATH", str(test_gif))
+    monkeypatch.setenv("SNAPSHOT_PATH", str(test_data))
+    monkeypatch.setenv("DIST_SNAPSHOT_PATH", str(test_dist))
+
+    from src.fetcher import ContributionResult
+    sample_grid = {(0, 0): {"date": "2026-11-01", "row": 0, "col": 0, "count": 1, "commit_count": 1, "level": 1}}
+    monkeypatch.setattr(
+        doggo, "fetch_contributions",
+        lambda *args, **kwargs: ContributionResult(sample_grid, list(sample_grid.values()), 1, None, True)
+    )
+    monkeypatch.setattr(doggo, "render_gif", _mock_valid_render_gif)
+
+    real_replace = os.replace
+    def failing_replace(src, dst):
+        if str(dst) == str(test_gif):
+            raise OSError("Simulated permission failure replacing GIF file")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+
+    exit_code = doggo.main()
+    assert exit_code == 1
+
+    assert test_gif.read_bytes() == orig_gif
+    assert test_data.read_bytes() == orig_data
+    assert test_dist.read_bytes() == orig_dist
+
+    for f in tmp_path.glob("**/*"):
+        assert not f.name.endswith(".tmp")
+        assert not f.name.endswith(".tmp.gif")
+        assert not f.name.endswith(".bak")
+
+
+def test_transactional_rollback_on_data_snapshot_promotion_failure(tmp_path, monkeypatch):
+    """Rollback test: failure when promoting data snapshot rolls back already-promoted GIF."""
+    import doggo
+    test_gif, test_data, test_dist, orig_gif, orig_data, orig_dist = _setup_isolated_workspace(tmp_path)
+
+    monkeypatch.setattr(doggo, "OUTPUT_PATH", str(test_gif))
+    monkeypatch.setenv("SNAPSHOT_PATH", str(test_data))
+    monkeypatch.setenv("DIST_SNAPSHOT_PATH", str(test_dist))
+
+    from src.fetcher import ContributionResult
+    sample_grid = {(0, 0): {"date": "2026-11-01", "row": 0, "col": 0, "count": 1, "commit_count": 1, "level": 1}}
+    monkeypatch.setattr(
+        doggo, "fetch_contributions",
+        lambda *args, **kwargs: ContributionResult(sample_grid, list(sample_grid.values()), 1, None, True)
+    )
+    monkeypatch.setattr(doggo, "render_gif", _mock_valid_render_gif)
+
+    real_replace = os.replace
+    def failing_replace(src, dst):
+        if str(dst) == str(test_data):
+            raise OSError("Simulated permission failure replacing data snapshot")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+
+    exit_code = doggo.main()
+    assert exit_code == 1
+
+    # GIF must be rolled back to original valid state!
+    assert test_gif.read_bytes() == orig_gif
+    assert test_data.read_bytes() == orig_data
+    assert test_dist.read_bytes() == orig_dist
+
+    for f in tmp_path.glob("**/*"):
+        assert not f.name.endswith(".tmp")
+        assert not f.name.endswith(".tmp.gif")
+        assert not f.name.endswith(".bak")
+
+
+def test_transactional_rollback_on_dist_snapshot_promotion_failure(tmp_path, monkeypatch):
+    """Rollback test: failure when promoting dist snapshot rolls back both GIF and data snapshot."""
+    import doggo
+    test_gif, test_data, test_dist, orig_gif, orig_data, orig_dist = _setup_isolated_workspace(tmp_path)
+
+    monkeypatch.setattr(doggo, "OUTPUT_PATH", str(test_gif))
+    monkeypatch.setenv("SNAPSHOT_PATH", str(test_data))
+    monkeypatch.setenv("DIST_SNAPSHOT_PATH", str(test_dist))
+
+    from src.fetcher import ContributionResult
+    sample_grid = {(0, 0): {"date": "2026-11-01", "row": 0, "col": 0, "count": 1, "commit_count": 1, "level": 1}}
+    monkeypatch.setattr(
+        doggo, "fetch_contributions",
+        lambda *args, **kwargs: ContributionResult(sample_grid, list(sample_grid.values()), 1, None, True)
+    )
+    monkeypatch.setattr(doggo, "render_gif", _mock_valid_render_gif)
+
+    real_replace = os.replace
+    def failing_replace(src, dst):
+        if str(dst) == str(test_dist):
+            raise OSError("Simulated permission failure replacing dist snapshot")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+
+    exit_code = doggo.main()
+    assert exit_code == 1
+
+    assert test_gif.read_bytes() == orig_gif
+    assert test_data.read_bytes() == orig_data
+    assert test_dist.read_bytes() == orig_dist
+
+    for f in tmp_path.glob("**/*"):
+        assert not f.name.endswith(".tmp")
+        assert not f.name.endswith(".tmp.gif")
+        assert not f.name.endswith(".bak")
+
+
+def test_successful_complete_transaction(tmp_path, monkeypatch):
+    """Transaction success test: all artifacts promoted and backups cleanly removed."""
+    import doggo
+    test_gif, test_data, test_dist, orig_gif, orig_data, orig_dist = _setup_isolated_workspace(tmp_path)
+
+    monkeypatch.setattr(doggo, "OUTPUT_PATH", str(test_gif))
+    monkeypatch.setenv("SNAPSHOT_PATH", str(test_data))
+    monkeypatch.setenv("DIST_SNAPSHOT_PATH", str(test_dist))
+
+    from src.fetcher import ContributionResult
+    sample_grid = {(0, 0): {"date": "2026-11-01", "row": 0, "col": 0, "count": 5, "commit_count": 5, "level": 2}}
+    monkeypatch.setattr(
+        doggo, "fetch_contributions",
+        lambda *args, **kwargs: ContributionResult(sample_grid, list(sample_grid.values()), 5, None, True)
+    )
+    monkeypatch.setattr(doggo, "render_gif", _mock_valid_render_gif)
+
+    exit_code = doggo.main()
+    assert exit_code == 0
+
+    # Promoted files have new content
+    assert test_gif.read_bytes() != orig_gif
+    assert test_data.read_bytes() != orig_data
+    assert test_dist.read_bytes() != orig_dist
+    assert b'"total_contributions": 5' in test_data.read_bytes()
+    assert b'"total_contributions": 5' in test_dist.read_bytes()
+
+    # Backups and temporary files removed
+    for f in tmp_path.glob("**/*"):
+        assert not f.name.endswith(".tmp")
+        assert not f.name.endswith(".tmp.gif")
+        assert not f.name.endswith(".bak")
+
+
+def test_safe_early_error_handling_before_rendering(tmp_path, monkeypatch, capsys):
+    """
+    FIX 3 REGRESSION: Early network/API failure before rendering starts
+    must exit cleanly with code 1, preserve all files, leave no temporary files,
+    and avoid UnboundLocalError in exception handler.
+    """
+    import doggo
+    test_gif, test_data, test_dist, orig_gif, orig_data, orig_dist = _setup_isolated_workspace(tmp_path)
+
+    monkeypatch.setattr(doggo, "OUTPUT_PATH", str(test_gif))
+    monkeypatch.setenv("SNAPSHOT_PATH", str(test_data))
+    monkeypatch.setenv("DIST_SNAPSHOT_PATH", str(test_dist))
+
+    def failing_fetch(*args, **kwargs):
+        raise RuntimeError("GitHub API network connection refused")
+
+    monkeypatch.setattr(doggo, "fetch_contributions", failing_fetch)
+
+    # Must exit cleanly with return code 1, without UnboundLocalError
+    exit_code = doggo.main()
+    assert exit_code == 1
+
+    captured = capsys.readouterr()
+    assert "Generation failed: GitHub API network connection refused" in captured.err
+
+    # Previous files must remain completely unchanged
+    assert test_gif.read_bytes() == orig_gif
+    assert test_data.read_bytes() == orig_data
+    assert test_dist.read_bytes() == orig_dist
+
+    # Zero temporary or backup files left behind
+    for f in tmp_path.glob("**/*"):
+        assert not f.name.endswith(".tmp")
+        assert not f.name.endswith(".tmp.gif")
+        assert not f.name.endswith(".bak")

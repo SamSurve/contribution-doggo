@@ -94,6 +94,43 @@ def detect_new_contributions(
     return newly_detected
 
 
+def stage_snapshot_data(
+    grid_days: Dict[Tuple[int, int], Dict[str, Any]],
+    total_contributions: int,
+    username: str = "SamSurve",
+    commit_tracking_available: bool = True,
+) -> Dict[str, Any]:
+    """
+    Builds and validates the contribution and commit snapshot dictionary in memory.
+    Refuses to advance if the calendar grid is empty or commit tracking is incomplete.
+    """
+    if not grid_days:
+        raise RuntimeError("Refusing to advance contribution snapshot: calendar grid is empty.")
+
+    if not commit_tracking_available or any(item.get("commit_count") is None for item in grid_days.values()):
+        raise RuntimeError(
+            "Refusing to advance contribution snapshot: commit tracking data is unavailable or incomplete."
+        )
+
+    daily_counts = {item["date"]: item["count"] for item in grid_days.values() if item["count"] > 0}
+    daily_commit_counts = {
+        item["date"]: int(item.get("commit_count", 0))
+        for item in grid_days.values()
+        if int(item.get("commit_count", 0)) > 0
+    }
+    total_commits = sum(daily_commit_counts.values())
+
+    return {
+        "username": username,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "total_contributions": total_contributions,
+        "total_commits": total_commits,
+        "active_days_count": len(daily_counts),
+        "daily_counts": daily_counts,
+        "daily_commit_counts": daily_commit_counts,
+    }
+
+
 def save_snapshot(
     grid_days: Dict[Tuple[int, int], Dict[str, Any]],
     total_contributions: int,
@@ -106,36 +143,21 @@ def save_snapshot(
     Refuses to advance if commit tracking data is unavailable or incomplete.
     Propagates any persistence exceptions so failed writes never print success
     or advance stored baselines.
-    """
-    if not grid_days:
-        raise RuntimeError("Refusing to advance contribution snapshot: calendar grid is empty.")
 
-    if not commit_tracking_available or any(item.get("commit_count") is None for item in grid_days.values()):
-        raise RuntimeError(
-            "Refusing to advance contribution snapshot: commit tracking data is unavailable or incomplete."
-        )
+    ISOLATION RULE:
+    If destination is provided (e.g. test tmp_path), writes ONLY to that destination.
+    It NEVER creates, modifies, or mirrors into production data/ or dist/ snapshot files.
+    Mirroring to dist/ is strictly reserved for the primary production snapshot.
+    """
+    snapshot = stage_snapshot_data(
+        grid_days=grid_days,
+        total_contributions=total_contributions,
+        username=username,
+        commit_tracking_available=commit_tracking_available,
+    )
 
     target = destination or SNAPSHOT_FILE
     target.parent.mkdir(parents=True, exist_ok=True)
-
-    # Store separate daily_counts (calendar) and daily_commit_counts (commits)
-    daily_counts = {item["date"]: item["count"] for item in grid_days.values() if item["count"] > 0}
-    daily_commit_counts = {
-        item["date"]: int(item.get("commit_count", 0))
-        for item in grid_days.values()
-        if int(item.get("commit_count", 0)) > 0
-    }
-    total_commits = sum(daily_commit_counts.values())
-
-    snapshot = {
-        "username": username,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "total_contributions": total_contributions,
-        "total_commits": total_commits,
-        "active_days_count": len(daily_counts),
-        "daily_counts": daily_counts,
-        "daily_commit_counts": daily_commit_counts,
-    }
 
     # Atomic write to target file: write to .tmp in same directory, fsync, then atomic replace
     temp_target = target.with_suffix(".tmp")
@@ -145,8 +167,10 @@ def save_snapshot(
         os.fsync(f.fileno())
     os.replace(temp_target, target)
 
-    # Mirror to dist/ if target is the primary data snapshot
-    if target != DIST_SNAPSHOT:
+    # Mirror to dist/ ONLY when saving the primary production snapshot.
+    # Custom test destinations must NEVER create, modify, or mirror into data/ or dist/ production files!
+    is_primary_production = (destination is None) or (target.resolve() == SNAPSHOT_FILE.resolve())
+    if is_primary_production:
         DIST_SNAPSHOT.parent.mkdir(parents=True, exist_ok=True)
         temp_dist = DIST_SNAPSHOT.with_suffix(".tmp")
         with open(temp_dist, "w", encoding="utf-8") as f:

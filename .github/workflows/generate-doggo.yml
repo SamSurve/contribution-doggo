@@ -45,12 +45,15 @@ jobs:
       - name: Restore previous contribution snapshot
         continue-on-error: true
         run: |
-          mkdir -p data
+          mkdir -p data dist
+          # Clean stale snapshots before restoration to prevent loading test data
+          rm -f data/contributions_snapshot.json dist/contributions_snapshot.json
           if git show origin/output:contributions_snapshot.json > data/contributions_snapshot.json 2>/dev/null; then
-            echo "[SNAPSHOT] Successfully restored previous snapshot from origin/output branch."
+            cp data/contributions_snapshot.json dist/contributions_snapshot.json
+            echo "[SNAPSHOT] Successfully restored previous production snapshot from origin/output branch."
           else
-            rm -f data/contributions_snapshot.json
-            echo "[SNAPSHOT] No previous snapshot found on origin/output branch; using initial baseline."
+            rm -f data/contributions_snapshot.json dist/contributions_snapshot.json
+            echo "[SNAPSHOT] No previous snapshot found on origin/output branch; initializing first-run baseline."
           fi
 
       - name: Generate animation from contribution calendar
