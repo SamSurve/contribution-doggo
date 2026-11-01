@@ -10,6 +10,7 @@ Comprehensive unit tests for snapshot engine:
 """
 import json
 import os
+import shutil
 import pytest
 from pathlib import Path
 from src.snapshot import (
@@ -622,3 +623,111 @@ def test_safe_early_error_handling_before_rendering(tmp_path, monkeypatch, capsy
         assert not f.name.endswith(".tmp")
         assert not f.name.endswith(".tmp.gif")
         assert not f.name.endswith(".bak")
+
+
+def test_backup_cleanup_failure_does_not_rollback_successful_transaction(tmp_path, monkeypatch, capsys):
+    """
+    Edge case: After all three artifacts are promoted and verified,
+    a failure during best-effort backup deletion (e.g. PermissionError on unlink)
+    must NOT trigger rollback of an already successful transaction.
+    """
+    import doggo
+    test_gif, test_data, test_dist, orig_gif, orig_data, orig_dist = _setup_isolated_workspace(tmp_path)
+
+    monkeypatch.setattr(doggo, "OUTPUT_PATH", str(test_gif))
+    monkeypatch.setenv("SNAPSHOT_PATH", str(test_data))
+    monkeypatch.setenv("DIST_SNAPSHOT_PATH", str(test_dist))
+
+    from src.fetcher import ContributionResult
+    sample_grid = {(0, 0): {"date": "2026-11-01", "row": 0, "col": 0, "count": 10, "commit_count": 10, "level": 3}}
+    monkeypatch.setattr(
+        doggo, "fetch_contributions",
+        lambda *args, **kwargs: ContributionResult(sample_grid, list(sample_grid.values()), 10, None, True)
+    )
+    monkeypatch.setattr(doggo, "render_gif", _mock_valid_render_gif)
+
+    # Simulate unlink failure on all .bak files during post-commit cleanup
+    real_unlink = Path.unlink
+    def failing_unlink(self, *args, **kwargs):
+        if self.name.endswith(".bak"):
+            raise PermissionError(f"Simulated permission denied unlinking backup {self.name}")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+
+    exit_code = doggo.main()
+    assert exit_code == 0
+
+    # The transaction must be successfully committed with new contents (not rolled back!)
+    assert test_gif.read_bytes() != orig_gif
+    assert test_data.read_bytes() != orig_data
+    assert test_dist.read_bytes() != orig_dist
+    assert b'"total_contributions": 10' in test_data.read_bytes()
+    assert b'"total_contributions": 10' in test_dist.read_bytes()
+
+    # Warning logged to stderr about best-effort cleanup
+    captured = capsys.readouterr()
+    assert "[CLEANUP-WARN]" in captured.err
+
+
+def test_backup_restoration_failure_preserves_backup_for_manual_recovery(tmp_path, monkeypatch, capsys):
+    """
+    Edge case: During rollback, if restoring a backup fails, that backup file
+    must NEVER be unlinked or destroyed. It must be preserved for manual recovery.
+    """
+    import doggo
+    test_gif, test_data, test_dist, orig_gif, orig_data, orig_dist = _setup_isolated_workspace(tmp_path)
+
+    monkeypatch.setattr(doggo, "OUTPUT_PATH", str(test_gif))
+    monkeypatch.setenv("SNAPSHOT_PATH", str(test_data))
+    monkeypatch.setenv("DIST_SNAPSHOT_PATH", str(test_dist))
+
+    from src.fetcher import ContributionResult
+    sample_grid = {(0, 0): {"date": "2026-11-01", "row": 0, "col": 0, "count": 1, "commit_count": 1, "level": 1}}
+    monkeypatch.setattr(
+        doggo, "fetch_contributions",
+        lambda *args, **kwargs: ContributionResult(sample_grid, list(sample_grid.values()), 1, None, True)
+    )
+    monkeypatch.setattr(doggo, "render_gif", _mock_valid_render_gif)
+
+    # 1. Trigger failure during data snapshot promotion to start rollback
+    real_replace = os.replace
+    def failing_replace(src, dst):
+        if str(dst) == str(test_data):
+            raise OSError("Simulated data snapshot promotion failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+
+    # 2. Simulate failure when restoring GIF backup during rollback
+    real_copy2 = shutil.copy2
+    def failing_copy2(src, dst):
+        if str(src).endswith(".gif.bak"):
+            raise PermissionError("Simulated permission failure restoring GIF backup")
+        return real_copy2(src, dst)
+
+    monkeypatch.setattr(shutil, "copy2", failing_copy2)
+
+    exit_code = doggo.main()
+    assert exit_code == 1
+
+    # GIF backup restoration failed -> backup file MUST STILL EXIST with valid original content!
+    backup_gif = test_gif.with_suffix(".gif.bak")
+    assert backup_gif.exists()
+    assert backup_gif.read_bytes() == orig_gif
+
+    # Data snapshot backup restoration succeeded -> restored to original and backup unlinked
+    backup_data = test_data.with_suffix(".json.bak")
+    assert not backup_data.exists()
+    assert test_data.read_bytes() == orig_data
+
+    # Staging files cleaned up
+    stage_gif = test_gif.with_suffix(".tmp.gif")
+    stage_data = test_data.with_suffix(".tmp")
+    assert not stage_gif.exists()
+    assert not stage_data.exists()
+
+    # Diagnostic warning logged to stderr
+    captured = capsys.readouterr()
+    assert "Failed to restore GIF backup" in captured.err
+    assert "Preserving backup for manual recovery" in captured.err

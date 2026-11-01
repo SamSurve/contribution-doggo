@@ -64,6 +64,7 @@ def main() -> int:
     dist_promoted = False
     has_new_snapshot_to_promote = False
     should_mirror_dist = (not snapshot_path_env and not dist_snap_env) or (dist_snap_env is not None)
+    transaction_committed = False
 
     try:
         # 1. Back up all existing valid production artifacts
@@ -211,13 +212,17 @@ def main() -> int:
             if should_mirror_dist and (not dist_snap.is_file() or dist_snap.stat().st_size == 0):
                 raise RuntimeError("Promoted dist snapshot file is missing or empty.")
 
-        # 10. Only after ALL operations succeed, delete the backups
-        if has_gif_backup and backup_gif.exists():
-            backup_gif.unlink()
-        if has_data_backup and backup_data.exists():
-            backup_data.unlink()
-        if has_dist_backup and backup_dist.exists():
-            backup_dist.unlink()
+        # Mark transaction committed: all promotions and verifications succeeded.
+        # Any subsequent cleanup issues must not trigger rollback of verified artifacts.
+        transaction_committed = True
+
+        # 10. Best-effort cleanup of backup files
+        for backup_path in (backup_gif, backup_data, backup_dist):
+            if backup_path.exists():
+                try:
+                    backup_path.unlink()
+                except Exception as cleanup_err:
+                    print(f"[CLEANUP-WARN] Could not remove backup {backup_path.name}: {cleanup_err}", file=sys.stderr)
 
         if has_new_snapshot_to_promote:
             print("[OK] Updated persistent contribution snapshots (data/ and dist/).")
@@ -225,17 +230,29 @@ def main() -> int:
         return 0
 
     except Exception as exc:
+        if transaction_committed:
+            # Transaction already verified and committed. Do not rollback.
+            print(f"[WARN] Non-fatal error after transaction commit: {exc}", file=sys.stderr)
+            return 0
+
         print(f"ERROR: Generation failed: {exc}", file=sys.stderr)
         print("[ROLLBACK] Initiating complete transactional rollback of all production artifacts...", file=sys.stderr)
 
         # 1. Rollback GIF
+        restored_gif_backup = False
         if has_gif_backup and backup_gif.exists():
             try:
                 shutil.copy2(backup_gif, out_file)
-                backup_gif.unlink()
+                restored_gif_backup = True
                 print(f"[ROLLBACK] Restored previous valid GIF to {out_file}.", file=sys.stderr)
             except Exception as e:
-                print(f"[ROLLBACK-WARN] Failed to restore GIF backup: {e}", file=sys.stderr)
+                print(f"[ROLLBACK-WARN] Failed to restore GIF backup: {e}. Preserving backup for manual recovery.", file=sys.stderr)
+
+        if restored_gif_backup and backup_gif.exists():
+            try:
+                backup_gif.unlink()
+            except Exception:
+                pass
         elif not has_gif_backup and gif_promoted and out_file.exists():
             try:
                 out_file.unlink()
@@ -243,13 +260,20 @@ def main() -> int:
                 pass
 
         # 2. Rollback Data Snapshot
+        restored_data_backup = False
         if has_data_backup and backup_data.exists():
             try:
                 shutil.copy2(backup_data, data_snap)
-                backup_data.unlink()
+                restored_data_backup = True
                 print(f"[ROLLBACK] Restored previous data snapshot to {data_snap}.", file=sys.stderr)
             except Exception as e:
-                print(f"[ROLLBACK-WARN] Failed to restore data snapshot backup: {e}", file=sys.stderr)
+                print(f"[ROLLBACK-WARN] Failed to restore data snapshot backup: {e}. Preserving backup for manual recovery.", file=sys.stderr)
+
+        if restored_data_backup and backup_data.exists():
+            try:
+                backup_data.unlink()
+            except Exception:
+                pass
         elif not has_data_backup and data_promoted and data_snap.exists():
             try:
                 data_snap.unlink()
@@ -257,21 +281,29 @@ def main() -> int:
                 pass
 
         # 3. Rollback Dist Snapshot
+        restored_dist_backup = False
         if has_dist_backup and backup_dist.exists():
             try:
                 shutil.copy2(backup_dist, dist_snap)
-                backup_dist.unlink()
+                restored_dist_backup = True
                 print(f"[ROLLBACK] Restored previous dist snapshot to {dist_snap}.", file=sys.stderr)
             except Exception as e:
-                print(f"[ROLLBACK-WARN] Failed to restore dist snapshot backup: {e}", file=sys.stderr)
+                print(f"[ROLLBACK-WARN] Failed to restore dist snapshot backup: {e}. Preserving backup for manual recovery.", file=sys.stderr)
+
+        if restored_dist_backup and backup_dist.exists():
+            try:
+                backup_dist.unlink()
+            except Exception:
+                pass
         elif not has_dist_backup and dist_promoted and dist_snap.exists():
             try:
                 dist_snap.unlink()
             except Exception:
                 pass
 
-        # 4. Clean up any lingering temporary / staging files
-        for tmp_file in (stage_gif, stage_data, stage_dist, backup_gif, backup_data, backup_dist):
+        # 4. Clean up lingering temporary staging files ONLY
+        # Backups whose restoration failed are preserved on disk for manual recovery.
+        for tmp_file in (stage_gif, stage_data, stage_dist):
             if tmp_file.exists():
                 try:
                     tmp_file.unlink()
