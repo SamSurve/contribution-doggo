@@ -43,3 +43,15 @@ e:\DOGGO/
 ## Security
 
 Authentication uses the `DOGGO_TOKEN` Actions secret for GraphQL queries. Tokens and secrets are never committed or exposed.
+
+## Known Limitations
+
+- **GraphQL 100-Repository Coverage**: The GraphQL query scans up to 100 repositories containing commit contributions over the past year (`maxRepositories: 100`) and paginates their commit connections. For users with commits across more than 100 distinct repositories in a single year, commit tracking aggregates the top 100 repositories returned by GitHub's GraphQL API.
+- **Unauthenticated Local Development**: Without a GitHub personal access token (`DOGGO_TOKEN`), local runs use public HTML scraping (`fetch_contributions_web`). In this fallback, contribution squares are rendered for the visual calendar, but commit-specific tracking is marked unavailable (`commit_count = None`) and snapshot baseline advancement is safely skipped.
+
+## v2 Visual Redesign (branch `claude/visual-redesign`)
+- **Sprites** (`src/corgi.py`): hand-authored ASCII pixel parts (body, head, front-face head, 4 ear poses) composed per frame with auto-outline. 8 states: idle(4) walk(6) run(6) look_around(4) sniff(4) paw_touch(4) happy(4) rest(4). Same 32x22 RGBA API; renderer scales 2x nearest-neighbour.
+- **Story** (`expand_timeline` in `src/renderer.py`): rest -> wake -> walk/run with ease-in/out -> look around -> sniff -> paw lift/touch -> stamp -> happy wag -> patrol -> settle to rest. Planner untouched; the renderer re-times its output.
+- **Grid**: same 53x7 geometry (GX/GY/CELL/STEP unchanged). Flat rounded cells, quieter labels, subtle gold tint + hairline ring on target, three rising scent dots, stamp ring on pawprint.
+- **Loop seam**: first and last frames are pixel-identical (paws fade during final rest).
+- **Output**: one shared palette for all frames (no flicker, no dither), per-frame durations, bundled Pillow font (no system fonts).

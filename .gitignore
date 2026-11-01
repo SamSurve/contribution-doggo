@@ -7,3 +7,4 @@ dist/
 *.png
 *.gif
 .pytest_cache/
+visual-redesign.diff

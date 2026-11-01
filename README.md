@@ -23,6 +23,11 @@ A premium animated pixel-art corgi companion that physically lives inside your G
 4. Renders an optimized animated GIF with smooth frame timing and compact file size.
 5. GitHub Actions runs daily and publishes the latest GIF to the `output` branch.
 
+## Known Limitations
+
+- **GraphQL 100-Repository Coverage**: GitHub's GraphQL `commitContributionsByRepository` API query scans up to 100 repositories containing commit contributions over the past year (`maxRepositories: 100`), with full pagination across their commit connections. For users whose commits span more than 100 repositories within a single year, commit tracking aggregates the top 100 repositories returned by GitHub's GraphQL API.
+- **Unauthenticated Local Development**: Without a GitHub personal access token (`DOGGO_TOKEN`), local runs use public HTML scraping (`fetch_contributions_web`). In this unauthenticated fallback, full contribution squares are rendered for the visual calendar, but commit-specific tracking is marked unavailable (`commit_count = None`) to prevent false commit alerts, and snapshot baseline advancement is safely skipped.
+
 ## Local Development
 
 ```bash
