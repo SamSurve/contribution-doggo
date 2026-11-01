@@ -46,7 +46,12 @@ jobs:
         continue-on-error: true
         run: |
           mkdir -p data
-          git show origin/output:contributions_snapshot.json > data/contributions_snapshot.json 2>/dev/null || true
+          if git show origin/output:contributions_snapshot.json > data/contributions_snapshot.json 2>/dev/null; then
+            echo "[SNAPSHOT] Successfully restored previous snapshot from origin/output branch."
+          else
+            rm -f data/contributions_snapshot.json
+            echo "[SNAPSHOT] No previous snapshot found on origin/output branch; using initial baseline."
+          fi
 
       - name: Generate animation from contribution calendar
         env:

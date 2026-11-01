@@ -15,6 +15,34 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import requests
 
 
+class ContributionResult(tuple):
+    """
+    Subclasses 4-tuple (grid_days, active_days, total_contributions, brightest_day)
+    while exposing commit_tracking_available attribute for downstream logic.
+    """
+    grid_days: Dict[Tuple[int, int], Dict[str, Any]]
+    active_days: List[Dict[str, Any]]
+    total_contributions: int
+    brightest_day: Optional[Dict[str, Any]]
+    commit_tracking_available: bool
+
+    def __new__(
+        cls,
+        grid_days: Dict[Tuple[int, int], Dict[str, Any]],
+        active_days: List[Dict[str, Any]],
+        total_contributions: int,
+        brightest_day: Optional[Dict[str, Any]],
+        commit_tracking_available: bool = True,
+    ):
+        obj = super().__new__(cls, (grid_days, active_days, total_contributions, brightest_day))
+        obj.grid_days = grid_days
+        obj.active_days = active_days
+        obj.total_contributions = total_contributions
+        obj.brightest_day = brightest_day
+        obj.commit_tracking_available = commit_tracking_available
+        return obj
+
+
 GRAPHQL_QUERY_INITIAL = """
 query($login: String!) {
   user(login: $login) {
@@ -187,6 +215,7 @@ def fetch_contributions_graphql(
                 "col": c_idx,
                 "count": cnt,  # Total contributions (issues + PRs + commits)
                 "commit_count": 0,  # Will be populated from commitContributionsByRepository
+                "commit_tracking_available": True,
                 "level": lvl,
             }
             grid_days[(c_idx, r_idx)] = item
@@ -195,24 +224,41 @@ def fetch_contributions_graphql(
     repo_entries = collec.get("commitContributionsByRepository", [])
 
     # Check for repositories requiring pagination (more than 100 commit contribution days)
-    # Paginate any repository connection that has hasNextPage
+    # Paginate any repository connection that has hasNextPage.
+    # Never silently break on failed pagination requests, GraphQL errors, missing matching repos or non-advancing cursors.
     for repo_entry in repo_entries:
         conn = repo_entry.get("contributions", {})
         page_info = conn.get("pageInfo", {})
-        repo_name = repo_entry.get("repository", {}).get("nameWithOwner")
+        repo_name = repo_entry.get("repository", {}).get("nameWithOwner", "unknown")
+        prev_cursor = None
         while page_info.get("hasNextPage"):
             cursor = page_info.get("endCursor")
             if not cursor:
-                break
+                raise RuntimeError(
+                    f"GraphQL pagination error for repository '{repo_name}': "
+                    "hasNextPage is True but endCursor is missing or empty."
+                )
+            if cursor == prev_cursor:
+                raise RuntimeError(
+                    f"GraphQL pagination error for repository '{repo_name}': "
+                    f"non-advancing endCursor detected ({cursor})."
+                )
+            prev_cursor = cursor
+
             page_resp = s.post(
                 "https://api.github.com/graphql",
                 headers=headers,
                 json={"query": GRAPHQL_QUERY_PAGINATE_REPO, "variables": {"login": username, "cursor": cursor}},
                 timeout=25,
             )
-            if page_resp.status_code != 200:
-                break
-            page_data = page_resp.json().get("data", {}).get("user", {}).get("contributionsCollection", {})
+            page_resp.raise_for_status()
+            page_payload = page_resp.json()
+            if page_payload.get("errors"):
+                raise RuntimeError(
+                    f"GraphQL pagination error for repository '{repo_name}': {page_payload['errors']}"
+                )
+
+            page_data = page_payload.get("data", {}).get("user", {}).get("contributionsCollection", {})
             page_repos = page_data.get("commitContributionsByRepository", [])
             # Find matching repo entry in the paginated page
             matched_repo = next(
@@ -220,11 +266,18 @@ def fetch_contributions_graphql(
                 None,
             )
             if not matched_repo:
-                break
+                raise RuntimeError(
+                    f"GraphQL pagination error: matching repository '{repo_name}' "
+                    f"not found in paginated response for cursor '{cursor}'."
+                )
+
             next_conn = matched_repo.get("contributions", {})
-            next_nodes = next_conn.get("nodes", [])
-            if not next_nodes:
-                break
+            next_nodes = next_conn.get("nodes")
+            if next_nodes is None:
+                raise RuntimeError(
+                    f"GraphQL pagination error for repository '{repo_name}': contributions nodes is None."
+                )
+
             conn["nodes"].extend(next_nodes)
             page_info = next_conn.get("pageInfo", {})
 
@@ -243,32 +296,41 @@ def fetch_contributions_graphql(
     total_contributions = int(cal.get("totalContributions", sum(d["count"] for d in grid_days.values())))
     brightest_day = max(active_days, key=lambda x: x["count"]) if active_days else None
 
-    return grid_days, active_days, total_contributions, brightest_day
+    return ContributionResult(
+        grid_days, active_days, total_contributions, brightest_day, commit_tracking_available=True
+    )
 
 
 def fetch_contributions_web(
     username: str,
     session: Optional[requests.Session] = None,
-) -> Tuple[Dict[Tuple[int, int], Dict[str, Any]], List[Dict[str, Any]], int, Dict[str, Any] | None]:
+) -> ContributionResult:
     """
     Public web fallback for unauthenticated local development.
+    Commit-specific tracking is unavailable via public HTML scraping;
+    commit_count is explicitly set to None and commit_tracking_available is False.
+    Total contribution counts are NEVER equated with commit counts.
     """
     s = session or requests.Session()
     url = f"https://github.com/users/{username}/contributions"
     r = s.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
     r.raise_for_status()
 
-    matches = re.findall(
-        r'id="contribution-day-component-(\d+)-(\d+)"\s+data-level="(\d+)"[^>]*data-date="([0-9-]+)"',
-        r.text,
-    )
+    matches: List[Tuple[str, str, str, str]] = []
+    for tag in re.finditer(r'<[^>]*id="contribution-day-component-(\d+)-(\d+)"[^>]*>', r.text):
+        row_s, col_s = tag.group(1), tag.group(2)
+        tag_str = tag.group(0)
+        dt_m = re.search(r'data-date="([0-9-]+)"', tag_str)
+        lvl_m = re.search(r'data-level="(\d+)"', tag_str)
+        if dt_m and lvl_m:
+            matches.append((row_s, col_s, lvl_m.group(1), dt_m.group(1)))
+
     if not matches:
+        # Fallback regex for reversed attribute structures
         matches = re.findall(
-            r'data-date="([0-9-]+)"[^>]*id="contribution-day-component-(\d+)-(\d+)"[^>]*data-level="(\d+)"',
+            r'id="contribution-day-component-(\d+)-(\d+)"\s+data-level="(\d+)"[^>]*data-date="([0-9-]+)"',
             r.text,
         )
-        if matches:
-            matches = [(m[1], m[2], m[3], m[0]) for m in matches]
 
     tooltip_map: Dict[str, int] = {}
     for m in re.finditer(r'for="(contribution-day-component-\d+-\d+)"[^>]*>\s*([0-9]+|No)\s+contribution', r.text):
@@ -289,7 +351,8 @@ def fetch_contributions_web(
             "row": r_i,
             "col": c_i,
             "count": cnt,
-            "commit_count": cnt,  # Web fallback defaults commit_count to contribution count
+            "commit_count": None,  # NEVER use total contribution counts as commit counts
+            "commit_tracking_available": False,
             "level": l_i,
         }
         grid_days[(c_i, r_i)] = item
@@ -298,11 +361,11 @@ def fetch_contributions_web(
 
     total = sum(d["count"] for d in grid_days.values())
     brightest = max(active_days, key=lambda x: x["count"]) if active_days else None
-    return grid_days, active_days, total, brightest
+    return ContributionResult(grid_days, active_days, total, brightest, commit_tracking_available=False)
 
 
 def fetch_contributions_synthetic(
-) -> Tuple[Dict[Tuple[int, int], Dict[str, Any]], List[Dict[str, Any]], int, Dict[str, Any] | None]:
+) -> ContributionResult:
     """
     Offline synthetic calendar strictly used for isolated unit tests.
     """
@@ -326,6 +389,7 @@ def fetch_contributions_synthetic(
                 "col": c,
                 "count": cnt,
                 "commit_count": cnt,
+                "commit_tracking_available": True,
                 "level": lvl,
             }
             grid_days[(c, r)] = item
@@ -334,18 +398,18 @@ def fetch_contributions_synthetic(
 
     total = sum(d["count"] for d in grid_days.values())
     brightest = max(active_days, key=lambda x: x["count"]) if active_days else None
-    return grid_days, active_days, total, brightest
+    return ContributionResult(grid_days, active_days, total, brightest, commit_tracking_available=True)
 
 
 def fetch_contributions(
     username: str = "SamSurve",
     token: str | None = None,
     allow_synthetic: bool = False,
-) -> Tuple[Dict[Tuple[int, int], Dict[str, Any]], List[Dict[str, Any]], int, Dict[str, Any] | None]:
+) -> ContributionResult:
     """
     Primary fetcher dispatch:
     1. Authenticated GraphQL query with commitContributionsByRepository
-    2. Public web fallback
+    2. Public web fallback (marks commit tracking unavailable)
     3. Guarded synthetic fallback (tests only)
     """
     auth_token = token or os.getenv("DOGGO_TOKEN") or os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN")
@@ -354,8 +418,13 @@ def fetch_contributions(
         try:
             return fetch_contributions_graphql(username=username, token=auth_token)
         except Exception as exc:
-            # Avoid leaking token string in error prints
-            print(f"[WARN] GraphQL fetch failed ({type(exc).__name__}). Falling back to web endpoint...")
+            # If in CI/production, raise immediately to prevent incomplete/misleading publication
+            is_production_ci = bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
+            if is_production_ci and not allow_synthetic:
+                raise RuntimeError(
+                    f"Production GraphQL fetch failed: {exc}. Preventing fallback to protect state."
+                ) from exc
+            print(f"[WARN] GraphQL fetch failed ({type(exc).__name__}: {exc}). Falling back to web endpoint...")
 
     try:
         return fetch_contributions_web(username=username)

@@ -182,3 +182,227 @@ def test_graphql_pagination(monkeypatch):
     assert (0, 4) in grid_days
     # Commits from page 1 (10) + page 2 (15) = 25
     assert grid_days[(0, 4)]["commit_count"] == 25
+
+
+def test_web_fallback_marks_commit_tracking_unavailable(monkeypatch):
+    """
+    Public web fallback must never equate total contribution counts with commits.
+    Must set commit_count=None and commit_tracking_available=False.
+    """
+    html_sample = """
+    <div>
+      <td id="contribution-day-component-2-10" data-date="2026-10-25" data-level="3"></td>
+      <tool-tip for="contribution-day-component-2-10">8 contributions on October 25, 2026</tool-tip>
+    </div>
+    """
+    class MockWebResponse:
+        def __init__(self, text):
+            self.text = text
+            self.status_code = 200
+        def raise_for_status(self):
+            pass
+
+    import requests
+    monkeypatch.setattr(requests.Session, "get", lambda self, url, headers=None, timeout=None: MockWebResponse(html_sample))
+
+    from src.fetcher import fetch_contributions_web
+    res = fetch_contributions_web(username="SamSurve")
+
+    assert res.commit_tracking_available is False
+    grid_days, active_days, total, brightest = res
+    assert (10, 2) in grid_days
+    item = grid_days[(10, 2)]
+    assert item["count"] == 8
+    # Must NEVER use total contribution count as commit count
+    assert item["commit_count"] is None
+    assert item["commit_tracking_available"] is False
+
+
+def test_graphql_pagination_missing_cursor_raises(monkeypatch):
+    """
+    If hasNextPage is True but endCursor is missing or empty,
+    pagination must raise RuntimeError and never silently truncate.
+    """
+    page_data = {
+        "data": {
+            "user": {
+                "contributionsCollection": {
+                    "contributionCalendar": {
+                        "totalContributions": 10,
+                        "weeks": [{"contributionDays": [{"date": "2026-10-29", "contributionCount": 10, "contributionLevel": "FOURTH_QUARTILE", "weekday": 4}]}],
+                    },
+                    "commitContributionsByRepository": [
+                        {
+                            "repository": {"nameWithOwner": "SamSurve/RepoWithBuggyCursor"},
+                            "contributions": {
+                                "nodes": [{"occurredAt": "2026-10-29T10:00:00Z", "commitCount": 5, "isRestricted": False}],
+                                "pageInfo": {"hasNextPage": True, "endCursor": None},  # Missing cursor!
+                            },
+                        }
+                    ],
+                }
+            }
+        }
+    }
+    class MockResp:
+        def __init__(self, d):
+            self._d = d
+            self.status_code = 200
+        def json(self):
+            return self._d
+        def raise_for_status(self):
+            pass
+
+    import requests
+    monkeypatch.setattr(requests.Session, "post", lambda self, url, headers=None, json=None, timeout=None: MockResp(page_data))
+
+    with pytest.raises(RuntimeError, match="endCursor is missing or empty"):
+        fetch_contributions_graphql(username="SamSurve", token="fake_token")
+
+
+def test_graphql_pagination_non_advancing_cursor_raises(monkeypatch):
+    """
+    If endCursor does not advance between pages, pagination must raise RuntimeError.
+    """
+    page_data = {
+        "data": {
+            "user": {
+                "contributionsCollection": {
+                    "contributionCalendar": {
+                        "totalContributions": 10,
+                        "weeks": [{"contributionDays": [{"date": "2026-10-29", "contributionCount": 10, "contributionLevel": "FOURTH_QUARTILE", "weekday": 4}]}],
+                    },
+                    "commitContributionsByRepository": [
+                        {
+                            "repository": {"nameWithOwner": "SamSurve/RepoStuckCursor"},
+                            "contributions": {
+                                "nodes": [{"occurredAt": "2026-10-29T10:00:00Z", "commitCount": 5, "isRestricted": False}],
+                                "pageInfo": {"hasNextPage": True, "endCursor": "stuck_cursor_token"},
+                            },
+                        }
+                    ],
+                }
+            }
+        }
+    }
+    class MockResp:
+        def __init__(self, d):
+            self._d = d
+            self.status_code = 200
+        def json(self):
+            return self._d
+        def raise_for_status(self):
+            pass
+
+    import requests
+    # Both initial and subsequent paginate calls return the same endCursor
+    monkeypatch.setattr(requests.Session, "post", lambda self, url, headers=None, json=None, timeout=None: MockResp(page_data))
+
+    with pytest.raises(RuntimeError, match="non-advancing endCursor"):
+        fetch_contributions_graphql(username="SamSurve", token="fake_token")
+
+
+def test_graphql_pagination_missing_repo_raises(monkeypatch):
+    """
+    If the matching repository is missing in the paginated response,
+    pagination must raise RuntimeError instead of silently terminating.
+    """
+    page1_data = {
+        "data": {
+            "user": {
+                "contributionsCollection": {
+                    "contributionCalendar": {
+                        "totalContributions": 10,
+                        "weeks": [{"contributionDays": [{"date": "2026-10-29", "contributionCount": 10, "contributionLevel": "FOURTH_QUARTILE", "weekday": 4}]}],
+                    },
+                    "commitContributionsByRepository": [
+                        {
+                            "repository": {"nameWithOwner": "SamSurve/RepoToFind"},
+                            "contributions": {
+                                "nodes": [{"occurredAt": "2026-10-29T10:00:00Z", "commitCount": 5, "isRestricted": False}],
+                                "pageInfo": {"hasNextPage": True, "endCursor": "page_2_cursor"},
+                            },
+                        }
+                    ],
+                }
+            }
+        }
+    }
+    page2_missing_repo = {
+        "data": {
+            "user": {
+                "contributionsCollection": {
+                    # No RepoToFind here!
+                    "commitContributionsByRepository": [],
+                }
+            }
+        }
+    }
+    class MockResp:
+        def __init__(self, d):
+            self._d = d
+            self.status_code = 200
+        def json(self):
+            return self._d
+        def raise_for_status(self):
+            pass
+
+    import requests
+    def mock_post(self, url, headers=None, json=None, timeout=None):
+        if "cursor" in json.get("variables", {}):
+            return MockResp(page2_missing_repo)
+        return MockResp(page1_data)
+
+    monkeypatch.setattr(requests.Session, "post", mock_post)
+
+    with pytest.raises(RuntimeError, match="matching repository 'SamSurve/RepoToFind' not found"):
+        fetch_contributions_graphql(username="SamSurve", token="fake_token")
+
+
+def test_graphql_pagination_graphql_error_raises(monkeypatch):
+    """
+    If paginated query returns GraphQL errors, must raise RuntimeError immediately.
+    """
+    page1_data = {
+        "data": {
+            "user": {
+                "contributionsCollection": {
+                    "contributionCalendar": {
+                        "totalContributions": 10,
+                        "weeks": [{"contributionDays": [{"date": "2026-10-29", "contributionCount": 10, "contributionLevel": "FOURTH_QUARTILE", "weekday": 4}]}],
+                    },
+                    "commitContributionsByRepository": [
+                        {
+                            "repository": {"nameWithOwner": "SamSurve/RepoError"},
+                            "contributions": {
+                                "nodes": [{"occurredAt": "2026-10-29T10:00:00Z", "commitCount": 5, "isRestricted": False}],
+                                "pageInfo": {"hasNextPage": True, "endCursor": "page_2_cursor"},
+                            },
+                        }
+                    ],
+                }
+            }
+        }
+    }
+    page2_error = {
+        "errors": [{"message": "Rate limit exceeded during connection pagination"}]
+    }
+    class MockResp:
+        def __init__(self, d):
+            self._d = d
+            self.status_code = 200
+        def json(self):
+            return self._d
+        def raise_for_status(self):
+            pass
+
+    import requests
+    def mock_post(self, url, headers=None, json=None, timeout=None):
+        if "cursor" in json.get("variables", {}):
+            return MockResp(page2_error)
+        return MockResp(page1_data)
+
+    monkeypatch.setattr(requests.Session, "post", mock_post)
+
+    with pytest.raises(RuntimeError, match="GraphQL pagination error"):
+        fetch_contributions_graphql(username="SamSurve", token="fake_token")

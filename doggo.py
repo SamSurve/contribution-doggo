@@ -40,27 +40,42 @@ def main() -> int:
         if prev_snapshot:
             tot_c = prev_snapshot.get("total_contributions", 0)
             tot_cm = prev_snapshot.get("total_commits", 0)
-            print(f"[SNAPSHOT] Loaded previous snapshot ({tot_c} contributions, {tot_cm} commits).")
+            is_legacy = "daily_commit_counts" not in prev_snapshot
+            if is_legacy:
+                print(f"[SNAPSHOT] Loaded legacy snapshot ({tot_c} contributions). Will perform baseline migration.")
+            else:
+                print(f"[SNAPSHOT] Loaded previous snapshot ({tot_c} contributions, {tot_cm} commits).")
         else:
             print("[SNAPSHOT] First-run baseline: initializing snapshot without previous history.")
 
         # 2. Fetch live contribution calendar (protects against synthetic mock overwrite)
         print(f"[DOGGO] Fetching GitHub contributions for @{USERNAME}...")
-        grid_days, active_days, total_contributions, peak_day = fetch_contributions(
+        contrib_data = fetch_contributions(
             username=USERNAME, token=TOKEN, allow_synthetic=False
+        )
+        grid_days, active_days, total_contributions, peak_day = contrib_data
+        commit_tracking_available = (
+            getattr(contrib_data, "commit_tracking_available", True)
+            and not any(item.get("commit_count") is None for item in grid_days.values())
         )
         print(f"[OK] Fetched {len(grid_days)} days ({len(active_days)} active). Total contributions: {total_contributions}.")
         if peak_day:
             print(f"[OK] Peak day: {peak_day['date']} with {peak_day['count']} contributions.")
 
         # 3. Detect newly added commits since previous snapshot (commit-specific)
-        new_commits = detect_new_contributions(grid_days, prev_snapshot)
-        if new_commits:
-            print(f"[NEW COMMITS] Detected {len(new_commits)} newly active/updated commit dates!")
-            for nc in new_commits[:4]:
-                print(f"  -> {nc['date']}: {nc.get('commit_count', 0)} commits (+{nc.get('new_commits_diff', 0)} new)")
+        if commit_tracking_available:
+            new_commits = detect_new_contributions(
+                grid_days, prev_snapshot, commit_tracking_available=True
+            )
+            if new_commits:
+                print(f"[NEW COMMITS] Detected {len(new_commits)} newly active/updated commit dates!")
+                for nc in new_commits[:4]:
+                    print(f"  -> {nc['date']}: {nc.get('commit_count', 0)} commits (+{nc.get('new_commits_diff', 0)} new)")
+            else:
+                print("[INFO] No new commit delta detected since last snapshot.")
         else:
-            print("[INFO] No new commit delta detected since last snapshot.")
+            new_commits = []
+            print("[WARN] Commit tracking is unavailable (public web fallback). Skipping commit detection.")
 
         # 4. Plan state machine patrol timeline with priority routing
         print("[DOGGO] Generating state machine patrol timeline...")
@@ -95,9 +110,14 @@ def main() -> int:
         else:
             raise RuntimeError("Renderer produced empty or missing temporary output file.")
 
-        # 6. Save new snapshot atomically - propagates on failure
-        save_snapshot(grid_days, total_contributions, username=USERNAME)
-        print("[OK] Updated persistent contribution snapshot.")
+        # 6. Save new snapshot atomically - only if commit tracking is available
+        if commit_tracking_available:
+            save_snapshot(
+                grid_days, total_contributions, username=USERNAME, commit_tracking_available=True
+            )
+            print("[OK] Updated persistent contribution snapshot.")
+        else:
+            print("[SNAPSHOT] Preserved existing snapshot without advancement (commit tracking was unavailable).")
         print(f"[OK] Successfully published {out_file} ({out_file.stat().st_size / 1024:.1f} KB).")
         return 0
 

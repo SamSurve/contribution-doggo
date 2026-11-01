@@ -171,3 +171,114 @@ def test_no_duplicate_detection_after_persistence(tmp_path):
     loaded = load_previous_snapshot(snap_file)
     new_commits = detect_new_contributions(grid, snapshot=loaded)
     assert new_commits == []
+
+
+def test_legacy_snapshot_migration_does_not_flag_historical_commits():
+    """
+    Legacy snapshots contain 'daily_counts' but lack 'daily_commit_counts'.
+    Migration must establish a baseline without falsely classifying the
+    entire historical calendar as new commits.
+    """
+    legacy_snapshot = {
+        "username": "SamSurve",
+        "total_contributions": 150,
+        "daily_counts": {
+            "2026-10-24": 13,
+            "2026-10-29": 24,
+            "2026-11-01": 9,
+        },
+        # NOTE: daily_commit_counts is deliberately absent (legacy format)
+    }
+    grid = {
+        (50, 6): {"date": "2026-10-24", "col": 50, "row": 6, "count": 13, "commit_count": 10, "level": 3},
+        (51, 4): {"date": "2026-10-29", "col": 51, "row": 4, "count": 24, "commit_count": 20, "level": 4},
+        (52, 0): {"date": "2026-11-01", "col": 52, "row": 0, "count": 9, "commit_count": 8, "level": 2},
+    }
+    new_commits = detect_new_contributions(grid, snapshot=legacy_snapshot)
+    # Must NOT classify legacy calendar days as new commits
+    assert new_commits == []
+    assert not any(item.get("is_new") for item in grid.values())
+
+
+def test_refuse_snapshot_advance_when_commit_tracking_unavailable(tmp_path):
+    """
+    Never advance the stored baseline when commit tracking data is unavailable
+    or incomplete (e.g. web fallback with commit_count=None).
+    """
+    snap_file = tmp_path / "protected_snapshot.json"
+    grid_with_none_commits = {
+        (51, 4): {"date": "2026-10-29", "col": 51, "row": 4, "count": 24, "commit_count": None, "level": 4},
+    }
+    with pytest.raises(RuntimeError, match="Refusing to advance contribution snapshot"):
+        save_snapshot(
+            grid_with_none_commits,
+            24,
+            destination=snap_file,
+            commit_tracking_available=False,
+        )
+    assert not snap_file.exists()
+
+
+def test_detect_new_contributions_disabled_when_tracking_unavailable():
+    """
+    When commit_tracking_available is False, detect_new_contributions
+    safely returns empty list rather than making inaccurate comparisons.
+    """
+    prev_snapshot = {
+        "daily_commit_counts": {"2026-10-29": 5},
+    }
+    grid = {
+        (51, 4): {"date": "2026-10-29", "col": 51, "row": 4, "count": 24, "commit_count": 20, "level": 4},
+    }
+    new_commits = detect_new_contributions(
+        grid, snapshot=prev_snapshot, commit_tracking_available=False
+    )
+    assert new_commits == []
+
+
+def test_consecutive_runs_lifecycle(tmp_path):
+    """
+    Simulates consecutive regeneration runs across multiple cycles:
+    - Run 1: initial baseline creation
+    - Run 2: consecutive run with zero changes produces 0 new commits
+    - Run 3: commits added to existing and new dates produces exact deltas
+    - Run 4: consecutive run after persistence produces 0 duplicate alerts
+    """
+    snap_file = tmp_path / "lifecycle_snapshot.json"
+
+    # Cycle 1: Baseline
+    grid_c1 = {
+        (47, 0): {"date": "2026-09-27", "col": 47, "row": 0, "count": 26, "commit_count": 26, "level": 4},
+        (50, 2): {"date": "2026-10-20", "col": 50, "row": 2, "count": 10, "commit_count": 10, "level": 3},
+    }
+    s1 = load_previous_snapshot(snap_file)
+    assert s1 is None
+    new_c1 = detect_new_contributions(grid_c1, snapshot=s1)
+    assert new_c1 == []  # First run baseline
+    save_snapshot(grid_c1, 36, username="SamSurve", destination=snap_file)
+
+    # Cycle 2: Immediate consecutive run with identical data
+    s2 = load_previous_snapshot(snap_file)
+    assert s2 is not None
+    assert s2["total_commits"] == 36
+    new_c2 = detect_new_contributions(grid_c1, snapshot=s2)
+    assert new_c2 == []  # No changes detected
+
+    # Cycle 3: New commits occur on 2026-10-20 (+5 commits) and new date 2026-11-01 (8 commits)
+    grid_c3 = {
+        (47, 0): {"date": "2026-09-27", "col": 47, "row": 0, "count": 26, "commit_count": 26, "level": 4},
+        (50, 2): {"date": "2026-10-20", "col": 50, "row": 2, "count": 15, "commit_count": 15, "level": 4},
+        (52, 0): {"date": "2026-11-01", "col": 52, "row": 0, "count": 8, "commit_count": 8, "level": 2},
+    }
+    new_c3 = detect_new_contributions(grid_c3, snapshot=s2)
+    assert len(new_c3) == 2
+    by_date = {nc["date"]: nc for nc in new_c3}
+    assert by_date["2026-10-20"]["new_commits_diff"] == 5
+    assert by_date["2026-11-01"]["new_commits_diff"] == 8
+    save_snapshot(grid_c3, 49, username="SamSurve", destination=snap_file)
+
+    # Cycle 4: Immediate consecutive run after Cycle 3 persistence
+    s4 = load_previous_snapshot(snap_file)
+    assert s4["total_commits"] == 49
+    new_c4 = detect_new_contributions(grid_c3, snapshot=s4)
+    assert new_c4 == []  # Zero duplicates

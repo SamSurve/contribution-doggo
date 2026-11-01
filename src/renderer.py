@@ -36,7 +36,7 @@ TEXT = (230, 237, 243)
 MUTED = (125, 133, 144)
 FAINT = (72, 80, 92)
 GOLD = (240, 190, 90)
-LEVELS = [(24, 30, 39), (14, 68, 41), (0, 109, 50), (38, 166, 65), (57, 211, 83)]
+LEVELS = [(22, 27, 34), (14, 68, 41), (0, 109, 50), (38, 166, 65), (57, 211, 83)]
 GREEN_LEVELS = LEVELS           # backwards-compatible alias
 PAW_COLOR = (255, 236, 190, 235)
 
@@ -225,7 +225,7 @@ def render_gif(
 
     last_month = None
     for col in range(WEEKS):
-        info = grid_days.get((col, 0))
+        info = next((grid_days.get((col, r)) for r in range(7) if (col, r) in grid_days), None)
         if info:
             dt = date.fromisoformat(info["date"])
             if dt.month != last_month:
