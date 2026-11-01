@@ -1,5 +1,7 @@
 """
 Pathfinding, target selection, and state machine planner for Contribution Doggo.
+Ensures newly detected commits become priority destinations visited before
+ordinary historical exploration.
 """
 from __future__ import annotations
 
@@ -15,11 +17,14 @@ WEEKS = 53
 
 def select_diverse_targets(active_days: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Selects 3 interesting, diverse target squares prioritizing:
-    0. Any newly detected commits from the latest snapshot
-    1. The peak brightest day
-    2. A high-activity day on a different row
-    3. The latest active contribution day
+    Selects target squares for Doggo's patrol.
+    Priority Rules:
+    1. Newly detected commit dates are top-priority destinations.
+       If several dates receive new commits, Doggo visits all selected new-commit targets
+       before ordinary historical exploration (up to 4 new commit dates).
+    2. If fewer than 3 new commit dates exist, supplements with key historical landmarks
+       (peak day, diverse-row day, recent active day).
+    3. If no new commits exist, performs standard diverse historical exploration.
     """
     if not active_days:
         return [
@@ -34,25 +39,46 @@ def select_diverse_targets(active_days: List[Dict[str, Any]]) -> List[Dict[str, 
 
     # Check for newly detected commits
     new_commits = [d for d in active_days if d.get("is_new")]
-    new_priority = new_commits[-1] if new_commits else None
 
-    # Select candidate on a significantly different row than peak
+    if new_commits:
+        # Sort new commits chronologically so movement between them flows cleanly
+        new_commits.sort(key=lambda x: (x["col"], x["row"]))
+        # Select up to 4 new commit dates to maintain ideal animation length
+        selected_new = new_commits[:4]
+        targets: List[Dict[str, Any]] = list(selected_new)
+
+        # Supplement with historical landmarks if under target capacity
+        if len(targets) < 3:
+            # Check peak day
+            if not any(t["col"] == peak["col"] and t["row"] == peak["row"] for t in targets):
+                targets.append(peak)
+
+        if len(targets) < 3:
+            # Check diverse row
+            diff_row_candidates = [
+                d for d in active_days
+                if not any(t["col"] == d["col"] and t["row"] == d["row"] for t in targets)
+                and abs(d["row"] - targets[0]["row"]) >= 2
+            ]
+            if diff_row_candidates:
+                targets.append(max(diff_row_candidates, key=lambda x: x["count"]))
+
+        return targets
+
+    # Standard historical exploration (no new commits detected)
     diff_row_candidates = [
         d for d in active_days
         if abs(d["row"] - peak["row"]) >= 2 and d["col"] != peak["col"]
     ]
     diff_row = max(diff_row_candidates, key=lambda x: x["count"]) if diff_row_candidates else None
-
-    # Earlier cluster
     earlier = by_date[0] if (by_date[0]["col"] != peak["col"] or by_date[0]["row"] != peak["row"]) else None
 
-    pool = [c for c in [new_priority, earlier, peak, diff_row, latest] if c is not None]
+    pool = [c for c in [earlier, peak, diff_row, latest] if c is not None]
     unique_targets: List[Dict[str, Any]] = []
     for item in pool:
         if not any(t["col"] == item["col"] and t["row"] == item["row"] for t in unique_targets):
             unique_targets.append(item)
 
-    # Ensure 3 targets if enough active days
     if len(unique_targets) < 3:
         for act in sorted(active_days, key=lambda x: x["count"], reverse=True):
             if not any(t["col"] == act["col"] and t["row"] == act["row"] for t in unique_targets):
@@ -60,7 +86,6 @@ def select_diverse_targets(active_days: List[Dict[str, Any]]) -> List[Dict[str, 
                 if len(unique_targets) == 3:
                     break
 
-    # Sort chronological so the patrol flows smoothly forward in time
     unique_targets.sort(key=lambda x: (x["col"], x["row"]))
     return unique_targets
 
@@ -143,6 +168,15 @@ def build_timeline(
         travel_steps = max(5, min(10, int(dist * 0.5) + 3))
         facing_left = (t_col < prev_col)
 
+        is_new = target.get("is_new", False)
+        diff = target.get("new_commits_diff", 1)
+
+        heading_status = (
+            f"TRACKING: Approaching NEW COMMIT on {t_date} (+{diff})!"
+            if is_new
+            else f"TRACKING: Approaching contribution square on {t_date}..."
+        )
+
         for s in range(1, travel_steps + 1):
             t = s / float(travel_steps)
             c = prev_col + dx * t
@@ -153,7 +187,7 @@ def build_timeline(
                 "facing_left": facing_left,
                 "state": "run",
                 "frame": s % 4,
-                "status": f"TRACKING: Approaching contribution square on {t_date}...",
+                "status": heading_status,
                 "target": None,
                 "paws": set(visited_paws),
                 "sparkle": False,
@@ -175,10 +209,21 @@ def build_timeline(
             sniff_x = t_cell_x - 26
         sniff_y = t_cell_y + CELL - 20
 
-        is_new = target.get("is_new", False)
-        sniff_status = f"NEW COMMIT: Sniffing fresh commit on {t_date}! ✦" if is_new else f"SNIFF: Discovered {t_date} · {t_count} contributions! ✦"
-        paw_status = f"NEW CODE: Verifying fresh commit on {t_date} 🐾" if is_new else "PAW TOUCH: Doggo verifying contribution square..."
-        stamp_status = f"APPROVED: Fresh commit verified on {t_date}! ⭐" if is_new else f"APPROVED: Verified {t_date}! Pawprint stamped."
+        sniff_status = (
+            f"NEW COMMIT: Sniffing fresh commit on {t_date} (+{diff})! ✦"
+            if is_new
+            else f"SNIFF: Discovered {t_date} · {t_count} contributions! ✦"
+        )
+        paw_status = (
+            f"NEW CODE: Doggo verifying fresh commit on {t_date} 🐾"
+            if is_new
+            else "PAW TOUCH: Doggo verifying contribution square..."
+        )
+        stamp_status = (
+            f"APPROVED: Fresh commit verified on {t_date}! ⭐"
+            if is_new
+            else f"APPROVED: Verified {t_date}! Pawprint stamped."
+        )
 
         # Sniff (3 frames)
         for sf in range(3):

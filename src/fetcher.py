@@ -1,160 +1,315 @@
 """
 Contribution data fetcher for Contribution Doggo.
-Supports GitHub GraphQL API with token, public contributions endpoint fallback,
-and offline mock calendar for testing (only when explicitly permitted).
+Fetches both contributionCalendar (for square rendering) and
+commitContributionsByRepository (for true commit-specific detection).
+Supports GraphQL pagination across repositories and contribution connections.
 """
 from __future__ import annotations
 
 import os
 import re
-from datetime import date, timedelta
-from typing import Any, Dict, List, Tuple
+from collections import defaultdict
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import requests
 
 
-def fetch_contributions(
-    username: str = "SamSurve",
-    token: str | None = None,
-    allow_synthetic: bool = False,
+GRAPHQL_QUERY_INITIAL = """
+query($login: String!) {
+  user(login: $login) {
+    contributionsCollection {
+      contributionCalendar {
+        totalContributions
+        weeks {
+          contributionDays {
+            date
+            contributionCount
+            contributionLevel
+            weekday
+          }
+        }
+      }
+      commitContributionsByRepository(maxRepositories: 100) {
+        repository {
+          nameWithOwner
+        }
+        contributions(first: 100) {
+          nodes {
+            occurredAt
+            commitCount
+            isRestricted
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+GRAPHQL_QUERY_PAGINATE_REPO = """
+query($login: String!, $cursor: String!) {
+  user(login: $login) {
+    contributionsCollection {
+      commitContributionsByRepository(maxRepositories: 100) {
+        repository {
+          nameWithOwner
+        }
+        contributions(first: 100, after: $cursor) {
+          nodes {
+            occurredAt
+            commitCount
+            isRestricted
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def normalize_occurred_at(occurred_at_str: str, valid_calendar_dates: Set[str]) -> str:
+    """
+    Normalizes an occurredAt ISO-8601 timestamp string into a YYYY-MM-DD date.
+    Aligns with GitHub's contributionCalendar dates, handling timezone boundary offsets.
+    """
+    raw_date = occurred_at_str[:10]
+    if raw_date in valid_calendar_dates:
+        return raw_date
+
+    # Parse ISO timestamp with timezone awareness
+    try:
+        clean_str = occurred_at_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(clean_str)
+    except Exception:
+        return raw_date
+
+    # If raw date is not directly in calendar dates (e.g. UTC shift around midnight),
+    # check +/- 1 calendar day
+    candidate_prev = (dt - timedelta(days=1)).strftime("%Y-%m-%d")
+    candidate_next = (dt + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    if candidate_prev in valid_calendar_dates:
+        return candidate_prev
+    if candidate_next in valid_calendar_dates:
+        return candidate_next
+
+    return raw_date
+
+
+def aggregate_commit_contributions(
+    repo_contributions_list: List[Dict[str, Any]],
+    valid_calendar_dates: Set[str],
+) -> Dict[str, int]:
+    """
+    Aggregates commitCount across all repositories by normalized date.
+    """
+    daily_commits: Dict[str, int] = defaultdict(int)
+
+    for repo_entry in repo_contributions_list:
+        contrib_conn = repo_entry.get("contributions", {})
+        nodes = contrib_conn.get("nodes", [])
+        for node in nodes:
+            occ_at = node.get("occurredAt")
+            if not occ_at:
+                continue
+            commits = int(node.get("commitCount", 0))
+            if commits <= 0:
+                continue
+            normalized_date = normalize_occurred_at(occ_at, valid_calendar_dates)
+            daily_commits[normalized_date] += commits
+
+    return dict(daily_commits)
+
+
+def fetch_contributions_graphql(
+    username: str,
+    token: str,
+    session: Optional[requests.Session] = None,
 ) -> Tuple[Dict[Tuple[int, int], Dict[str, Any]], List[Dict[str, Any]], int, Dict[str, Any] | None]:
     """
-    Fetches the 53x7 contribution calendar for the given username.
-    Returns:
-        (grid_days, active_days, total_contributions, brightest_day)
+    Queries GitHub GraphQL API with full repository coverage and pagination.
     """
-    auth_token = token or os.getenv("DOGGO_TOKEN") or os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN")
+    s = session or requests.Session()
+    headers = {"Authorization": f"Bearer {token}"}
 
-    # 1. Attempt GraphQL API if token is provided
-    if auth_token:
-        try:
-            query = """
-            query($login: String!) {
-              user(login: $login) {
-                contributionsCollection {
-                  contributionCalendar {
-                    totalContributions
-                    weeks {
-                      contributionDays {
-                        date
-                        contributionCount
-                        contributionLevel
-                        weekday
-                      }
-                    }
-                  }
-                }
-              }
+    resp = s.post(
+        "https://api.github.com/graphql",
+        headers=headers,
+        json={"query": GRAPHQL_QUERY_INITIAL, "variables": {"login": username}},
+        timeout=25,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    if payload.get("errors"):
+        raise RuntimeError(f"GraphQL error: {payload['errors']}")
+
+    user_data = payload.get("data", {}).get("user")
+    if not user_data:
+        raise RuntimeError(f"User @{username} not found in GraphQL response.")
+
+    collec = user_data["contributionsCollection"]
+    cal = collec["contributionCalendar"]
+    weeks_data = cal["weeks"]
+
+    level_map = {
+        "NONE": 0,
+        "FIRST_QUARTILE": 1,
+        "SECOND_QUARTILE": 2,
+        "THIRD_QUARTILE": 3,
+        "FOURTH_QUARTILE": 4,
+    }
+
+    grid_days: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    valid_calendar_dates: Set[str] = set()
+
+    for c_idx, wk in enumerate(weeks_data[-53:]):
+        for day in wk["contributionDays"]:
+            r_idx = int(day["weekday"])
+            cnt = int(day["contributionCount"])
+            lvl = level_map.get(day.get("contributionLevel", "NONE"), 0)
+            if cnt > 0 and lvl == 0:
+                lvl = 1
+            d_str = day["date"]
+            valid_calendar_dates.add(d_str)
+            item = {
+                "date": d_str,
+                "row": r_idx,
+                "col": c_idx,
+                "count": cnt,  # Total contributions (issues + PRs + commits)
+                "commit_count": 0,  # Will be populated from commitContributionsByRepository
+                "level": lvl,
             }
-            """
-            resp = requests.post(
+            grid_days[(c_idx, r_idx)] = item
+
+    # Collect initial commit contributions by repository
+    repo_entries = collec.get("commitContributionsByRepository", [])
+
+    # Check for repositories requiring pagination (more than 100 commit contribution days)
+    # Paginate any repository connection that has hasNextPage
+    for repo_entry in repo_entries:
+        conn = repo_entry.get("contributions", {})
+        page_info = conn.get("pageInfo", {})
+        repo_name = repo_entry.get("repository", {}).get("nameWithOwner")
+        while page_info.get("hasNextPage"):
+            cursor = page_info.get("endCursor")
+            if not cursor:
+                break
+            page_resp = s.post(
                 "https://api.github.com/graphql",
-                headers={"Authorization": f"Bearer {auth_token}"},
-                json={"query": query, "variables": {"login": username}},
-                timeout=20,
+                headers=headers,
+                json={"query": GRAPHQL_QUERY_PAGINATE_REPO, "variables": {"login": username, "cursor": cursor}},
+                timeout=25,
             )
-            if resp.status_code == 200:
-                payload = resp.json()
-                user = payload.get("data", {}).get("user")
-                if user:
-                    cal = user["contributionsCollection"]["contributionCalendar"]
-                    weeks_data = cal["weeks"]
-                    level_map = {
-                        "NONE": 0,
-                        "FIRST_QUARTILE": 1,
-                        "SECOND_QUARTILE": 2,
-                        "THIRD_QUARTILE": 3,
-                        "FOURTH_QUARTILE": 4,
-                    }
-                    grid_days: Dict[Tuple[int, int], Dict[str, Any]] = {}
-                    active_days: List[Dict[str, Any]] = []
-
-                    # Keep last 53 weeks
-                    for c_idx, wk in enumerate(weeks_data[-53:]):
-                        for day in wk["contributionDays"]:
-                            r_idx = int(day["weekday"])
-                            cnt = int(day["contributionCount"])
-                            lvl = level_map.get(day.get("contributionLevel", "NONE"), 0)
-                            if cnt > 0 and lvl == 0:
-                                lvl = 1
-                            item = {
-                                "date": day["date"],
-                                "row": r_idx,
-                                "col": c_idx,
-                                "count": cnt,
-                                "level": lvl,
-                            }
-                            grid_days[(c_idx, r_idx)] = item
-                            if cnt > 0:
-                                active_days.append(item)
-
-                    total = int(cal.get("totalContributions", sum(d["count"] for d in grid_days.values())))
-                    brightest = max(active_days, key=lambda x: x["count"]) if active_days else None
-                    return grid_days, active_days, total, brightest
-        except Exception:
-            # Fall through to web endpoint
-            pass
-
-    # 2. Public web endpoint fallback
-    try:
-        url = f"https://github.com/users/{username}/contributions"
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
-        if r.status_code == 200:
-            matches = re.findall(
-                r'id="contribution-day-component-(\d+)-(\d+)"\s+data-level="(\d+)"[^>]*data-date="([0-9-]+)"',
-                r.text,
+            if page_resp.status_code != 200:
+                break
+            page_data = page_resp.json().get("data", {}).get("user", {}).get("contributionsCollection", {})
+            page_repos = page_data.get("commitContributionsByRepository", [])
+            # Find matching repo entry in the paginated page
+            matched_repo = next(
+                (r for r in page_repos if r.get("repository", {}).get("nameWithOwner") == repo_name),
+                None,
             )
-            if not matches:
-                matches = re.findall(
-                    r'data-date="([0-9-]+)"[^>]*id="contribution-day-component-(\d+)-(\d+)"[^>]*data-level="(\d+)"',
-                    r.text,
-                )
-                if matches:
-                    matches = [(m[1], m[2], m[3], m[0]) for m in matches]
+            if not matched_repo:
+                break
+            next_conn = matched_repo.get("contributions", {})
+            next_nodes = next_conn.get("nodes", [])
+            if not next_nodes:
+                break
+            conn["nodes"].extend(next_nodes)
+            page_info = next_conn.get("pageInfo", {})
 
-            tooltip_map: Dict[str, int] = {}
-            for m in re.finditer(r'for="(contribution-day-component-\d+-\d+)"[^>]*>\s*([0-9]+|No)\s+contribution', r.text):
-                day_id = m.group(1)
-                cnt_str = m.group(2)
-                cnt = 0 if cnt_str == "No" else int(cnt_str)
-                tooltip_map[day_id] = cnt
+    # Aggregate commitCount values across repositories
+    daily_commits = aggregate_commit_contributions(repo_entries, valid_calendar_dates)
 
-            grid_days = {}
-            active_days = []
-            for row_s, col_s, lvl_s, dt_s in matches:
-                r_i, c_i, l_i = int(row_s), int(col_s), int(lvl_s)
-                day_id = f"contribution-day-component-{row_s}-{col_s}"
-                cnt = tooltip_map.get(day_id, l_i)
-                item = {
-                    "date": dt_s,
-                    "row": r_i,
-                    "col": c_i,
-                    "count": cnt,
-                    "level": l_i,
-                }
-                grid_days[(c_i, r_i)] = item
-                if cnt > 0:
-                    active_days.append(item)
+    # Populate commit_count on grid days
+    active_days: List[Dict[str, Any]] = []
+    for item in grid_days.values():
+        d_str = item["date"]
+        # Populate true commit-specific count
+        item["commit_count"] = daily_commits.get(d_str, 0)
+        if item["count"] > 0 or item["commit_count"] > 0:
+            active_days.append(item)
 
-            total = sum(d["count"] for d in grid_days.values())
-            brightest = max(active_days, key=lambda x: x["count"]) if active_days else None
-            return grid_days, active_days, total, brightest
-    except Exception:
-        pass
+    total_contributions = int(cal.get("totalContributions", sum(d["count"] for d in grid_days.values())))
+    brightest_day = max(active_days, key=lambda x: x["count"]) if active_days else None
 
-    # 3. Guard against synthetic data in production
-    can_use_synthetic = allow_synthetic or (os.getenv("ALLOW_SYNTHETIC", "").lower() in ("1", "true", "yes"))
-    if not can_use_synthetic:
-        raise RuntimeError(
-            f"Failed to fetch live contribution data from GitHub for @{username}. "
-            "Production output will not overwrite with synthetic data."
+    return grid_days, active_days, total_contributions, brightest_day
+
+
+def fetch_contributions_web(
+    username: str,
+    session: Optional[requests.Session] = None,
+) -> Tuple[Dict[Tuple[int, int], Dict[str, Any]], List[Dict[str, Any]], int, Dict[str, Any] | None]:
+    """
+    Public web fallback for unauthenticated local development.
+    """
+    s = session or requests.Session()
+    url = f"https://github.com/users/{username}/contributions"
+    r = s.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+    r.raise_for_status()
+
+    matches = re.findall(
+        r'id="contribution-day-component-(\d+)-(\d+)"\s+data-level="(\d+)"[^>]*data-date="([0-9-]+)"',
+        r.text,
+    )
+    if not matches:
+        matches = re.findall(
+            r'data-date="([0-9-]+)"[^>]*id="contribution-day-component-(\d+)-(\d+)"[^>]*data-level="(\d+)"',
+            r.text,
         )
+        if matches:
+            matches = [(m[1], m[2], m[3], m[0]) for m in matches]
 
-    # 4. Synthetic rolling calendar fallback (only for offline testing)
+    tooltip_map: Dict[str, int] = {}
+    for m in re.finditer(r'for="(contribution-day-component-\d+-\d+)"[^>]*>\s*([0-9]+|No)\s+contribution', r.text):
+        day_id = m.group(1)
+        cnt_str = m.group(2)
+        cnt = 0 if cnt_str == "No" else int(cnt_str)
+        tooltip_map[day_id] = cnt
+
+    grid_days: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    active_days: List[Dict[str, Any]] = []
+
+    for row_s, col_s, lvl_s, dt_s in matches:
+        r_i, c_i, l_i = int(row_s), int(col_s), int(lvl_s)
+        day_id = f"contribution-day-component-{row_s}-{col_s}"
+        cnt = tooltip_map.get(day_id, l_i)
+        item = {
+            "date": dt_s,
+            "row": r_i,
+            "col": c_i,
+            "count": cnt,
+            "commit_count": cnt,  # Web fallback defaults commit_count to contribution count
+            "level": l_i,
+        }
+        grid_days[(c_i, r_i)] = item
+        if cnt > 0:
+            active_days.append(item)
+
+    total = sum(d["count"] for d in grid_days.values())
+    brightest = max(active_days, key=lambda x: x["count"]) if active_days else None
+    return grid_days, active_days, total, brightest
+
+
+def fetch_contributions_synthetic(
+) -> Tuple[Dict[Tuple[int, int], Dict[str, Any]], List[Dict[str, Any]], int, Dict[str, Any] | None]:
+    """
+    Offline synthetic calendar strictly used for isolated unit tests.
+    """
     today = date.today()
     start_date = today - timedelta(days=52 * 7 + today.weekday())
-    grid_days = {}
-    active_days = []
+    grid_days: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    active_days: List[Dict[str, Any]] = []
 
     for c in range(53):
         for r in range(7):
@@ -165,7 +320,14 @@ def fetch_contributions(
             if c in (46, 47, 50, 51) and r in (0, 2, 4, 5):
                 cnt = 12 if (c == 47 and r == 0) else 5
                 lvl = 4 if cnt > 10 else 2
-            item = {"date": dt_s, "row": r, "col": c, "count": cnt, "level": lvl}
+            item = {
+                "date": dt_s,
+                "row": r,
+                "col": c,
+                "count": cnt,
+                "commit_count": cnt,
+                "level": lvl,
+            }
             grid_days[(c, r)] = item
             if cnt > 0:
                 active_days.append(item)
@@ -173,3 +335,38 @@ def fetch_contributions(
     total = sum(d["count"] for d in grid_days.values())
     brightest = max(active_days, key=lambda x: x["count"]) if active_days else None
     return grid_days, active_days, total, brightest
+
+
+def fetch_contributions(
+    username: str = "SamSurve",
+    token: str | None = None,
+    allow_synthetic: bool = False,
+) -> Tuple[Dict[Tuple[int, int], Dict[str, Any]], List[Dict[str, Any]], int, Dict[str, Any] | None]:
+    """
+    Primary fetcher dispatch:
+    1. Authenticated GraphQL query with commitContributionsByRepository
+    2. Public web fallback
+    3. Guarded synthetic fallback (tests only)
+    """
+    auth_token = token or os.getenv("DOGGO_TOKEN") or os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN")
+
+    if auth_token:
+        try:
+            return fetch_contributions_graphql(username=username, token=auth_token)
+        except Exception as exc:
+            # Avoid leaking token string in error prints
+            print(f"[WARN] GraphQL fetch failed ({type(exc).__name__}). Falling back to web endpoint...")
+
+    try:
+        return fetch_contributions_web(username=username)
+    except Exception as exc:
+        print(f"[WARN] Web endpoint fetch failed ({type(exc).__name__}).")
+
+    can_use_synthetic = allow_synthetic or (os.getenv("ALLOW_SYNTHETIC", "").lower() in ("1", "true", "yes"))
+    if not can_use_synthetic:
+        raise RuntimeError(
+            f"Failed to fetch live contribution data from GitHub for @{username}. "
+            "Production output will not overwrite with synthetic data."
+        )
+
+    return fetch_contributions_synthetic()

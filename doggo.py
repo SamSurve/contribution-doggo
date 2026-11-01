@@ -38,29 +38,33 @@ def main() -> int:
         # 1. Load previous contribution snapshot for diff detection
         prev_snapshot = load_previous_snapshot()
         if prev_snapshot:
-            print(f"[SNAPSHOT] Loaded previous snapshot ({prev_snapshot.get('total_contributions')} total commits).")
+            tot_c = prev_snapshot.get("total_contributions", 0)
+            tot_cm = prev_snapshot.get("total_commits", 0)
+            print(f"[SNAPSHOT] Loaded previous snapshot ({tot_c} contributions, {tot_cm} commits).")
+        else:
+            print("[SNAPSHOT] First-run baseline: initializing snapshot without previous history.")
 
         # 2. Fetch live contribution calendar (protects against synthetic mock overwrite)
         print(f"[DOGGO] Fetching GitHub contributions for @{USERNAME}...")
-        grid_days, active_days, total_commits, peak_day = fetch_contributions(
+        grid_days, active_days, total_contributions, peak_day = fetch_contributions(
             username=USERNAME, token=TOKEN, allow_synthetic=False
         )
-        print(f"[OK] Fetched {len(grid_days)} days ({len(active_days)} active). Total contributions: {total_commits}.")
+        print(f"[OK] Fetched {len(grid_days)} days ({len(active_days)} active). Total contributions: {total_contributions}.")
         if peak_day:
-            print(f"[OK] Peak day: {peak_day['date']} with {peak_day['count']} commits.")
+            print(f"[OK] Peak day: {peak_day['date']} with {peak_day['count']} contributions.")
 
-        # 3. Detect newly added commits since previous snapshot
+        # 3. Detect newly added commits since previous snapshot (commit-specific)
         new_commits = detect_new_contributions(grid_days, prev_snapshot)
         if new_commits:
-            print(f"[NEW COMMITS] Detected {len(new_commits)} newly active/updated days!")
-            for nc in new_commits[:3]:
-                print(f"  -> {nc['date']}: {nc['count']} commits (+{nc.get('new_diff', 0)} new)")
+            print(f"[NEW COMMITS] Detected {len(new_commits)} newly active/updated commit dates!")
+            for nc in new_commits[:4]:
+                print(f"  -> {nc['date']}: {nc.get('commit_count', 0)} commits (+{nc.get('new_commits_diff', 0)} new)")
         else:
             print("[INFO] No new commit delta detected since last snapshot.")
 
-        # 4. Plan state machine patrol timeline
+        # 4. Plan state machine patrol timeline with priority routing
         print("[DOGGO] Generating state machine patrol timeline...")
-        timeline = build_timeline(grid_days, active_days, total_commits, peak_day)
+        timeline = build_timeline(grid_days, active_days, total_contributions, peak_day)
         print(f"[OK] Generated {len(timeline)} timeline beats.")
 
         # 5. Prepare destination directory & backup existing valid GIF
@@ -77,7 +81,7 @@ def main() -> int:
         render_gif(
             grid_days=grid_days,
             timeline=timeline,
-            total_commits=total_commits,
+            total_commits=total_contributions,
             peak_day=peak_day,
             username=USERNAME,
             output_path=str(temp_out),
@@ -91,8 +95,8 @@ def main() -> int:
         else:
             raise RuntimeError("Renderer produced empty or missing temporary output file.")
 
-        # 6. Save new snapshot
-        save_snapshot(grid_days, total_commits, username=USERNAME)
+        # 6. Save new snapshot atomically - propagates on failure
+        save_snapshot(grid_days, total_contributions, username=USERNAME)
         print("[OK] Updated persistent contribution snapshot.")
         print(f"[OK] Successfully published {out_file} ({out_file.stat().st_size / 1024:.1f} KB).")
         return 0

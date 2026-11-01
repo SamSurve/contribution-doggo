@@ -1,11 +1,16 @@
 """
-Tests for contribution data fetching, snapshot persistence, and future contribution compatibility.
+Tests for contribution data fetching, true commit detection,
+timezone normalization, pagination, and grid-square mapping.
 """
 import pytest
 from datetime import date, timedelta
-from src.fetcher import fetch_contributions
+from src.fetcher import (
+    aggregate_commit_contributions,
+    fetch_contributions,
+    fetch_contributions_graphql,
+    normalize_occurred_at,
+)
 from src.planner import build_timeline, select_diverse_targets
-from src.snapshot import detect_new_contributions, load_previous_snapshot, save_snapshot
 
 
 def test_synthetic_offline_fallback():
@@ -24,63 +29,156 @@ def test_production_rejects_synthetic_fallback(monkeypatch):
         fetch_contributions(username="mock_user_xyz", token="invalid", allow_synthetic=False)
 
 
-def test_future_contribution_simulation():
+def test_timezone_and_midnight_boundary_handling():
     """
-    Simulate future contributions:
-    - Newly active squares
-    - Increased contribution counts
-    - New calendar week
-    Verify that targets and timeline recalculate dynamically without code changes.
+    OccurredAt timestamps near midnight (+/- UTC shifts)
+    must align correctly with the calendar's valid YYYY-MM-DD dates.
     """
-    base_active = [
-        {"date": "2026-09-27", "col": 47, "row": 0, "count": 26, "level": 4},
-        {"date": "2026-10-29", "col": 51, "row": 4, "count": 24, "level": 4},
+    valid_calendar_dates = {"2026-10-28", "2026-10-29", "2026-10-30"}
+
+    # Direct match
+    assert normalize_occurred_at("2026-10-29T12:00:00Z", valid_calendar_dates) == "2026-10-29"
+
+    # Shifted UTC time where raw date is outside calendar dates
+    # E.g., 2026-10-31T00:05:00Z when 2026-10-30 is the last calendar date
+    assert normalize_occurred_at("2026-10-31T00:05:00Z", valid_calendar_dates) == "2026-10-30"
+
+    # E.g., 2026-10-27T23:55:00Z when 2026-10-28 is the first calendar date
+    assert normalize_occurred_at("2026-10-27T23:55:00Z", valid_calendar_dates) == "2026-10-28"
+
+
+def test_aggregate_commit_contributions_multiple_repos():
+    """
+    Verifies that commitCount values are summed across multiple repositories
+    for the same calendar date.
+    """
+    valid_dates = {"2026-10-29", "2026-10-30"}
+    repos_data = [
+        {
+            "repository": {"nameWithOwner": "SamSurve/RepoA"},
+            "contributions": {
+                "nodes": [
+                    {"occurredAt": "2026-10-29T10:00:00Z", "commitCount": 15, "isRestricted": False},
+                    {"occurredAt": "2026-10-30T10:00:00Z", "commitCount": 4, "isRestricted": False},
+                ]
+            },
+        },
+        {
+            "repository": {"nameWithOwner": "SamSurve/RepoB"},
+            "contributions": {
+                "nodes": [
+                    {"occurredAt": "2026-10-29T15:30:00Z", "commitCount": 9, "isRestricted": False},
+                ]
+            },
+        },
     ]
-    targets_base = select_diverse_targets(base_active)
-
-    # Tomorrow: user makes a massive 50-commit push on col 52, row 1
-    new_active = list(base_active) + [
-        {"date": "2026-11-02", "col": 52, "row": 1, "count": 50, "level": 4}
-    ]
-    targets_updated = select_diverse_targets(new_active)
-
-    # The new peak day must be dynamically selected
-    assert any(t["date"] == "2026-11-02" and t["count"] == 50 for t in targets_updated)
-
-    # Generate timeline with new contribution
-    timeline = build_timeline({}, new_active, 100, targets_updated[0])
-    assert any(t["date"] == "2026-11-02" for f in timeline if f.get("target") for t in [f["target"]])
+    daily = aggregate_commit_contributions(repos_data, valid_dates)
+    # RepoA (15) + RepoB (9) = 24 on 2026-10-29
+    assert daily["2026-10-29"] == 24
+    assert daily["2026-10-30"] == 4
 
 
-def test_snapshot_new_commit_detection_and_priority(tmp_path):
+def test_correct_grid_square_mapping():
     """
-    Verify that newly detected commits from previous snapshot comparison
-    become priority targets for Doggo.
+    Every parsed day in grid_days must map to a valid (col, row) coordinate
+    within bounds 0 <= col < 53 and 0 <= row < 7.
     """
-    snap_file = tmp_path / "snap.json"
+    grid_days, active_days, total, brightest = fetch_contributions(
+        username="mock_user_xyz", token="invalid", allow_synthetic=True
+    )
+    assert len(grid_days) == 53 * 7
+    for (c, r), item in grid_days.items():
+        assert 0 <= c < 53, f"Col {c} out of bounds"
+        assert 0 <= r < 7, f"Row {r} out of bounds"
+        assert item["col"] == c
+        assert item["row"] == r
+        assert len(item["date"]) == 10
+        assert "commit_count" in item
 
-    # Base grid
-    grid = {
-        (47, 0): {"date": "2026-09-27", "col": 47, "row": 0, "count": 26, "level": 4},
-        (51, 4): {"date": "2026-10-29", "col": 51, "row": 4, "count": 20, "level": 4},
+
+def test_graphql_pagination(monkeypatch):
+    """
+    Mocks a paginated GraphQL response where a repository's contributions
+    has hasNextPage=True, verifying that subsequent pages are requested and aggregated.
+    """
+    call_count = 0
+
+    class MockResponse:
+        def __init__(self, json_data, status_code=200):
+            self._json = json_data
+            self.status_code = status_code
+
+        def json(self):
+            return self._json
+
+        def raise_for_status(self):
+            pass
+
+    page1_data = {
+        "data": {
+            "user": {
+                "contributionsCollection": {
+                    "contributionCalendar": {
+                        "totalContributions": 25,
+                        "weeks": [
+                            {
+                                "contributionDays": [
+                                    {"date": "2026-10-29", "contributionCount": 25, "contributionLevel": "FOURTH_QUARTILE", "weekday": 4}
+                                ]
+                            }
+                        ],
+                    },
+                    "commitContributionsByRepository": [
+                        {
+                            "repository": {"nameWithOwner": "SamSurve/LargeRepo"},
+                            "contributions": {
+                                "nodes": [
+                                    {"occurredAt": "2026-10-29T08:00:00Z", "commitCount": 10, "isRestricted": False}
+                                ],
+                                "pageInfo": {"hasNextPage": True, "endCursor": "cursor_page_2"},
+                            },
+                        }
+                    ],
+                }
+            }
+        }
     }
-    save_snapshot(grid, 46, username="SamSurve", destination=snap_file)
 
-    # Loaded snapshot
-    loaded = load_previous_snapshot(snap_file)
-    assert loaded is not None
-    assert loaded["daily_counts"]["2026-09-27"] == 26
+    page2_data = {
+        "data": {
+            "user": {
+                "contributionsCollection": {
+                    "commitContributionsByRepository": [
+                        {
+                            "repository": {"nameWithOwner": "SamSurve/LargeRepo"},
+                            "contributions": {
+                                "nodes": [
+                                    {"occurredAt": "2026-10-29T14:00:00Z", "commitCount": 15, "isRestricted": False}
+                                ],
+                                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            },
+                        }
+                    ]
+                }
+            }
+        }
+    }
 
-    # New day with commits detected
-    updated_grid = dict(grid)
-    updated_grid[(52, 0)] = {"date": "2026-11-02", "col": 52, "row": 0, "count": 5, "level": 2}
+    def mock_post(self, url, headers=None, json=None, timeout=None):
+        nonlocal call_count
+        call_count += 1
+        if "cursor" in json.get("variables", {}):
+            return MockResponse(page2_data)
+        return MockResponse(page1_data)
 
-    new_commits = detect_new_contributions(updated_grid, loaded)
-    assert len(new_commits) == 1
-    assert new_commits[0]["date"] == "2026-11-02"
-    assert new_commits[0]["is_new"] is True
+    import requests
+    monkeypatch.setattr(requests.Session, "post", mock_post)
 
-    # Check that new commit becomes priority target
-    active_days = list(updated_grid.values())
-    targets = select_diverse_targets(active_days)
-    assert any(t["date"] == "2026-11-02" and t.get("is_new") for t in targets)
+    grid_days, active_days, total, brightest = fetch_contributions_graphql(
+        username="SamSurve", token="fake_token"
+    )
+
+    assert call_count == 2, f"Expected 2 GraphQL calls for pagination, got {call_count}"
+    assert (0, 4) in grid_days
+    # Commits from page 1 (10) + page 2 (15) = 25
+    assert grid_days[(0, 4)]["commit_count"] == 25

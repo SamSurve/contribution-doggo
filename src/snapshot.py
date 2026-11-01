@@ -1,7 +1,7 @@
 """
-Persistent contribution snapshot and new-commit detection engine.
-Maintains history across scheduled regenerations to detect fresh commits
-and prioritize them as primary targets for Contribution Doggo.
+Persistent contribution snapshot and commit-specific detection engine.
+Maintains history across scheduled regenerations to detect fresh commits,
+prevent false issue/PR detections, and ensure atomic persistence.
 """
 from __future__ import annotations
 
@@ -18,7 +18,8 @@ DIST_SNAPSHOT = Path("dist/contributions_snapshot.json")
 
 def load_previous_snapshot(custom_path: Optional[Path] = None) -> Optional[Dict[str, Any]]:
     """
-    Loads previous contribution snapshot from data/ or dist/ or output branch.
+    Loads previous contribution snapshot from custom path, data/, or dist/.
+    Returns None on first run if no valid snapshot exists.
     """
     candidates = [
         custom_path,
@@ -30,7 +31,7 @@ def load_previous_snapshot(custom_path: Optional[Path] = None) -> Optional[Dict[
             try:
                 with open(p, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    if isinstance(data, dict) and "daily_counts" in data:
+                    if isinstance(data, dict) and ("daily_commit_counts" in data or "daily_counts" in data):
                         return data
             except Exception:
                 pass
@@ -43,23 +44,36 @@ def detect_new_contributions(
 ) -> List[Dict[str, Any]]:
     """
     Compares current grid_days with the previous snapshot.
-    Identifies dates with increased contribution counts or newly active squares.
-    Marks items in grid_days with 'is_new' = True and 'diff' = added_commits.
-    Returns list of newly active / updated contribution days.
+
+    Rules:
+    - First-run baseline: if snapshot is None, returns [] (does not flag historical commits as new).
+    - Commit-specific: detects genuinely new commits where current_commit_count > prev_commit_count.
+    - Issue/PR isolation: an increase in total contribution count without a commit count increase
+      is NOT flagged as a new commit.
+    - Marks matching items in grid_days with 'is_new' = True and 'new_commits_diff' = diff.
+    - Returns list of newly active / updated commit dates sorted descending.
     """
-    if not snapshot or "daily_counts" not in snapshot:
+    if not snapshot:
+        # First-run baseline: do not treat existing calendar history as new commits
         return []
 
-    prev_counts: Dict[str, int] = snapshot["daily_counts"]
+    # Read previous commit counts; fall back to daily_counts only if legacy snapshot lacks daily_commit_counts
+    prev_commit_counts: Dict[str, int] = snapshot.get("daily_commit_counts")
+    if prev_commit_counts is None:
+        prev_commit_counts = snapshot.get("daily_counts", {})
+
     newly_detected: List[Dict[str, Any]] = []
 
     for item in grid_days.values():
         d_str = item["date"]
-        cnt = item["count"]
-        prev_cnt = prev_counts.get(d_str, 0)
-        if cnt > prev_cnt:
+        current_commits = item.get("commit_count", 0)
+        prev_commits = prev_commit_counts.get(d_str, 0)
+
+        # Genuinely new commits or increased commit count
+        if current_commits > prev_commits:
+            diff = current_commits - prev_commits
             item["is_new"] = True
-            item["new_diff"] = cnt - prev_cnt
+            item["new_commits_diff"] = diff
             newly_detected.append(item)
 
     # Sort descending by date (most recent new commits first)
@@ -74,29 +88,48 @@ def save_snapshot(
     destination: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
-    Saves current contribution snapshot to file for next comparison.
+    Atomically saves current contribution and commit counts to file.
+    Propagates any persistence exceptions so failed writes never print success
+    or advance stored baselines.
     """
     target = destination or SNAPSHOT_FILE
     target.parent.mkdir(parents=True, exist_ok=True)
 
+    # Store separate daily_counts (calendar) and daily_commit_counts (commits)
     daily_counts = {item["date"]: item["count"] for item in grid_days.values() if item["count"] > 0}
+    daily_commit_counts = {
+        item["date"]: item.get("commit_count", 0)
+        for item in grid_days.values()
+        if item.get("commit_count", 0) > 0
+    }
+    total_commits = sum(daily_commit_counts.values())
+
     snapshot = {
         "username": username,
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "total_contributions": total_contributions,
+        "total_commits": total_commits,
         "active_days_count": len(daily_counts),
         "daily_counts": daily_counts,
+        "daily_commit_counts": daily_commit_counts,
     }
 
-    try:
-        with open(target, "w", encoding="utf-8") as f:
+    # Atomic write to target file: write to .tmp in same directory, fsync, then atomic replace
+    temp_target = target.with_suffix(".tmp")
+    with open(temp_target, "w", encoding="utf-8") as f:
+        json.dump(snapshot, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp_target, target)
+
+    # Mirror to dist/ if target is the primary data snapshot
+    if target != DIST_SNAPSHOT:
+        DIST_SNAPSHOT.parent.mkdir(parents=True, exist_ok=True)
+        temp_dist = DIST_SNAPSHOT.with_suffix(".tmp")
+        with open(temp_dist, "w", encoding="utf-8") as f:
             json.dump(snapshot, f, indent=2)
-        # Also copy to dist/ if dist exists
-        if target != DIST_SNAPSHOT:
-            DIST_SNAPSHOT.parent.mkdir(parents=True, exist_ok=True)
-            with open(DIST_SNAPSHOT, "w", encoding="utf-8") as f:
-                json.dump(snapshot, f, indent=2)
-    except Exception as exc:
-        print(f"[WARN] Failed to write snapshot: {exc}")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_dist, DIST_SNAPSHOT)
 
     return snapshot
