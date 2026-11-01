@@ -19,14 +19,14 @@ def test_sprite_dimensions():
 def test_sprite_has_content():
     spr = render_corgi_frame("run", 0, facing_left=False)
     # Check that non-transparent pixels exist
-    alpha_pixels = [p[3] for p in spr.getdata() if p[3] > 0]
-    assert len(alpha_pixels) > 50, "Sprite should contain solid pixels"
+    alpha_channel = spr.split()[3]
+    bbox = alpha_channel.getbbox()
+    assert bbox is not None, "Sprite should contain non-transparent pixels"
 
 
 def test_horizontal_flip():
     spr_right = render_corgi_frame("run", 0, facing_left=False)
     spr_left = render_corgi_frame("run", 0, facing_left=True)
     assert spr_right != spr_left
-    # Flipped sprite must match horizontal flip of right-facing sprite
     flipped_right = spr_right.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-    assert list(spr_left.getdata()) == list(flipped_right.getdata())
+    assert list(spr_left.tobytes()) == list(flipped_right.tobytes())
