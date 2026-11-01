@@ -3,3 +3,7 @@ __pycache__/
 *.py[cod]
 .env
 .DS_Store
+dist/
+*.png
+*.gif
+.pytest_cache/

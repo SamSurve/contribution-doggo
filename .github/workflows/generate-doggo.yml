@@ -8,6 +8,8 @@ on:
     branches: [main]
     paths:
       - "doggo.py"
+      - "src/**"
+      - "tests/**"
       - "requirements.txt"
       - ".github/workflows/generate-doggo.yml"
 
@@ -35,8 +37,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Run test suite
+        run: pytest tests
+
       - name: Generate animation from contribution calendar
         env:
+          DOGGO_TOKEN: ${{ secrets.DOGGO_TOKEN }}
           GH_TOKEN: ${{ secrets.DOGGO_TOKEN }}
           GITHUB_USERNAME: SamSurve
         run: python doggo.py
