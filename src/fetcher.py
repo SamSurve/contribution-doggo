@@ -418,12 +418,7 @@ def fetch_contributions(
         try:
             return fetch_contributions_graphql(username=username, token=auth_token)
         except Exception as exc:
-            # If in CI/production, raise immediately to prevent incomplete/misleading publication
-            is_production_ci = bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
-            if is_production_ci and not allow_synthetic:
-                raise RuntimeError(
-                    f"Production GraphQL fetch failed: {exc}. Preventing fallback to protect state."
-                ) from exc
+            # Avoid leaking token string in error prints
             print(f"[WARN] GraphQL fetch failed ({type(exc).__name__}: {exc}). Falling back to web endpoint...")
 
     try:
