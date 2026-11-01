@@ -406,3 +406,54 @@ def test_graphql_pagination_graphql_error_raises(monkeypatch):
 
     with pytest.raises(RuntimeError, match="GraphQL pagination error"):
         fetch_contributions_graphql(username="SamSurve", token="fake_token")
+
+
+def test_incomplete_graphql_missing_collection_raises(monkeypatch):
+    """
+    If GraphQL response is missing contributionsCollection, it must raise RuntimeError.
+    """
+    payload = {"data": {"user": {"login": "SamSurve"}}}
+    class MockResp:
+        def __init__(self, d): self._d = d; self.status_code = 200
+        def json(self): return self._d
+        def raise_for_status(self): pass
+
+    import requests
+    monkeypatch.setattr(requests.Session, "post", lambda self, url, headers=None, json=None, timeout=None: MockResp(payload))
+
+    with pytest.raises(RuntimeError, match="missing contributionsCollection"):
+        fetch_contributions_graphql(username="SamSurve", token="fake_token")
+
+
+def test_incomplete_graphql_missing_calendar_raises(monkeypatch):
+    """
+    If GraphQL response is missing contributionCalendar, it must raise RuntimeError.
+    """
+    payload = {"data": {"user": {"login": "SamSurve", "contributionsCollection": {"commitContributionsByRepository": []}}}}
+    class MockResp:
+        def __init__(self, d): self._d = d; self.status_code = 200
+        def json(self): return self._d
+        def raise_for_status(self): pass
+
+    import requests
+    monkeypatch.setattr(requests.Session, "post", lambda self, url, headers=None, json=None, timeout=None: MockResp(payload))
+
+    with pytest.raises(RuntimeError, match="missing contributionCalendar"):
+        fetch_contributions_graphql(username="SamSurve", token="fake_token")
+
+
+def test_incomplete_graphql_missing_weeks_raises(monkeypatch):
+    """
+    If GraphQL response is missing weeks in contributionCalendar, it must raise RuntimeError.
+    """
+    payload = {"data": {"user": {"login": "SamSurve", "contributionsCollection": {"contributionCalendar": {"totalContributions": 0}}}}}
+    class MockResp:
+        def __init__(self, d): self._d = d; self.status_code = 200
+        def json(self): return self._d
+        def raise_for_status(self): pass
+
+    import requests
+    monkeypatch.setattr(requests.Session, "post", lambda self, url, headers=None, json=None, timeout=None: MockResp(payload))
+
+    with pytest.raises(RuntimeError, match="missing weeks"):
+        fetch_contributions_graphql(username="SamSurve", token="fake_token")

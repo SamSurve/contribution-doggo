@@ -185,9 +185,17 @@ def fetch_contributions_graphql(
     if not user_data:
         raise RuntimeError(f"User @{username} not found in GraphQL response.")
 
-    collec = user_data["contributionsCollection"]
-    cal = collec["contributionCalendar"]
-    weeks_data = cal["weeks"]
+    collec = user_data.get("contributionsCollection")
+    if not collec:
+        raise RuntimeError(f"Incomplete GraphQL response: missing contributionsCollection for @{username}.")
+
+    cal = collec.get("contributionCalendar")
+    if not cal:
+        raise RuntimeError(f"Incomplete GraphQL response: missing contributionCalendar for @{username}.")
+
+    weeks_data = cal.get("weeks")
+    if not weeks_data:
+        raise RuntimeError(f"Incomplete GraphQL response: missing weeks in contributionCalendar for @{username}.")
 
     level_map = {
         "NONE": 0,

@@ -82,7 +82,7 @@ def main() -> int:
         timeline = build_timeline(grid_days, active_days, total_contributions, peak_day)
         print(f"[OK] Generated {len(timeline)} timeline beats.")
 
-        # 5. Prepare destination directory & backup existing valid GIF
+        # 5. Transaction step 1: Preserve the old GIF backup
         out_file.parent.mkdir(parents=True, exist_ok=True)
         (out_file.parent / ".nojekyll").touch(exist_ok=True)
 
@@ -90,7 +90,7 @@ def main() -> int:
             shutil.copy2(out_file, backup_file)
             has_backup = True
 
-        # Render to a temporary staging file first (atomic generation)
+        # Transaction step 2: Generate and validate the new GIF to a staging file
         temp_out = out_file.with_suffix(".tmp.gif")
         print(f"[DOGGO] Rendering Contribution Doggo animation to {temp_out}...")
         render_gif(
@@ -102,15 +102,19 @@ def main() -> int:
             output_path=str(temp_out),
         )
 
-        # Atomic replacement of output file
-        if temp_out.exists() and temp_out.stat().st_size > 0:
-            temp_out.replace(out_file)
-            if has_backup and backup_file.exists():
-                backup_file.unlink()
-        else:
+        # Validate that the generated staging GIF exists and is non-empty
+        if not temp_out.exists() or temp_out.stat().st_size == 0:
             raise RuntimeError("Renderer produced empty or missing temporary output file.")
 
-        # 6. Save new snapshot atomically - only if commit tracking is available
+        # Validate that the generated file is a valid animated GIF
+        from PIL import Image as PILImage
+        with PILImage.open(temp_out) as test_img:
+            if getattr(test_img, "n_frames", 1) < 10:
+                raise RuntimeError(
+                    f"Generated GIF failed validation: insufficient frames ({getattr(test_img, 'n_frames', 1)})."
+                )
+
+        # Transaction step 3: Save the snapshot successfully BEFORE committing/deleting backup
         if commit_tracking_available:
             save_snapshot(
                 grid_days, total_contributions, username=USERNAME, commit_tracking_available=True
@@ -118,15 +122,28 @@ def main() -> int:
             print("[OK] Updated persistent contribution snapshot.")
         else:
             print("[SNAPSHOT] Preserved existing snapshot without advancement (commit tracking was unavailable).")
+
+        # Promote validated temp GIF to out_file
+        temp_out.replace(out_file)
+
+        # Transaction step 4: Only after BOTH operations succeed, delete the old backup
+        if has_backup and backup_file.exists():
+            backup_file.unlink()
+
         print(f"[OK] Successfully published {out_file} ({out_file.stat().st_size / 1024:.1f} KB).")
         return 0
 
     except Exception as exc:
         print(f"ERROR: Generation failed: {exc}", file=sys.stderr)
-        # Safe error recovery: restore previous valid GIF if it existed
+        # Transaction step 5: If either operation fails, restore previous GIF and preserve previous valid snapshot
         if has_backup and backup_file.exists():
             print("[RECOVERY] Restoring previous valid GIF to prevent profile breakage...", file=sys.stderr)
             backup_file.replace(out_file)
+        if temp_out.exists():
+            try:
+                temp_out.unlink()
+            except Exception:
+                pass
         return 1
 
 

@@ -107,6 +107,9 @@ def save_snapshot(
     Propagates any persistence exceptions so failed writes never print success
     or advance stored baselines.
     """
+    if not grid_days:
+        raise RuntimeError("Refusing to advance contribution snapshot: calendar grid is empty.")
+
     if not commit_tracking_available or any(item.get("commit_count") is None for item in grid_days.values()):
         raise RuntimeError(
             "Refusing to advance contribution snapshot: commit tracking data is unavailable or incomplete."

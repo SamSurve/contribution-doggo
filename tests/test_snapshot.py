@@ -282,3 +282,64 @@ def test_consecutive_runs_lifecycle(tmp_path):
     assert s4["total_commits"] == 49
     new_c4 = detect_new_contributions(grid_c3, snapshot=s4)
     assert new_c4 == []  # Zero duplicates
+
+
+def test_empty_grid_refuses_snapshot_advancement(tmp_path):
+    """
+    An empty calendar grid (e.g. from an incomplete GraphQL response)
+    must raise RuntimeError and refuse to overwrite the stored snapshot.
+    """
+    snap_file = tmp_path / "empty_grid_test.json"
+    with pytest.raises(RuntimeError, match="calendar grid is empty"):
+        save_snapshot({}, 0, destination=snap_file)
+    assert not snap_file.exists()
+
+
+def test_transactional_recovery_preserves_old_gif_on_failure(tmp_path, monkeypatch):
+    """
+    Transactional recovery: if snapshot saving fails after GIF generation,
+    the old GIF must be preserved/restored, and the backup file cleaned up.
+    """
+    import doggo
+
+    test_out = tmp_path / "test_doggo.gif"
+    # Create an initial valid existing GIF
+    test_out.write_bytes(b"ORIGINAL_VALID_GIF_BYTES_12345")
+    backup_file = test_out.with_suffix(".gif.bak")
+
+    monkeypatch.setattr(doggo, "OUTPUT_PATH", str(test_out))
+
+    # Mock fetch_contributions to return valid data
+    from src.fetcher import ContributionResult
+    sample_grid = {
+        (0, 0): {"date": "2026-11-01", "row": 0, "col": 0, "count": 1, "commit_count": 1, "level": 1}
+    }
+    monkeypatch.setattr(
+        doggo,
+        "fetch_contributions",
+        lambda *args, **kwargs: ContributionResult(sample_grid, list(sample_grid.values()), 1, None, True)
+    )
+
+    # Simulate render_gif writing a dummy valid GIF
+    from PIL import Image as PILImage
+    def mock_render_gif(**kwargs):
+        out_p = kwargs["output_path"]
+        img = PILImage.new("RGB", (10, 10), color="blue")
+        frames = [img.copy() for _ in range(12)]
+        frames[0].save(out_p, save_all=True, append_images=frames[1:])
+
+    monkeypatch.setattr(doggo, "render_gif", mock_render_gif)
+
+    # Force save_snapshot to fail (simulating disk/permission/validation error)
+    def failing_save_snapshot(*args, **kwargs):
+        raise OSError("Simulated disk error during save_snapshot")
+
+    monkeypatch.setattr(doggo, "save_snapshot", failing_save_snapshot)
+
+    # Run main() -> must exit with code 1
+    exit_code = doggo.main()
+    assert exit_code == 1
+
+    # ORIGINAL GIF MUST BE RESTORED!
+    assert test_out.exists()
+    assert test_out.read_bytes() == b"ORIGINAL_VALID_GIF_BYTES_12345"
