@@ -1,7 +1,7 @@
 """
 Contribution data fetcher for Contribution Doggo.
 Supports GitHub GraphQL API with token, public contributions endpoint fallback,
-and offline mock calendar for testing.
+and offline mock calendar for testing (only when explicitly permitted).
 """
 from __future__ import annotations
 
@@ -15,7 +15,8 @@ import requests
 
 def fetch_contributions(
     username: str = "SamSurve",
-    token: str | None = None
+    token: str | None = None,
+    allow_synthetic: bool = False,
 ) -> Tuple[Dict[Tuple[int, int], Dict[str, Any]], List[Dict[str, Any]], int, Dict[str, Any] | None]:
     """
     Fetches the 53x7 contribution calendar for the given username.
@@ -141,7 +142,15 @@ def fetch_contributions(
     except Exception:
         pass
 
-    # 3. Synthetic rolling calendar fallback (for offline tests)
+    # 3. Guard against synthetic data in production
+    can_use_synthetic = allow_synthetic or (os.getenv("ALLOW_SYNTHETIC", "").lower() in ("1", "true", "yes"))
+    if not can_use_synthetic:
+        raise RuntimeError(
+            f"Failed to fetch live contribution data from GitHub for @{username}. "
+            "Production output will not overwrite with synthetic data."
+        )
+
+    # 4. Synthetic rolling calendar fallback (only for offline testing)
     today = date.today()
     start_date = today - timedelta(days=52 * 7 + today.weekday())
     grid_days = {}
@@ -153,7 +162,6 @@ def fetch_contributions(
             dt_s = curr_date.isoformat()
             cnt = 0
             lvl = 0
-            # A few synthetic clusters
             if c in (46, 47, 50, 51) and r in (0, 2, 4, 5):
                 cnt = 12 if (c == 47 and r == 0) else 5
                 lvl = 4 if cnt > 10 else 2

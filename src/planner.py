@@ -16,6 +16,7 @@ WEEKS = 53
 def select_diverse_targets(active_days: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Selects 3 interesting, diverse target squares prioritizing:
+    0. Any newly detected commits from the latest snapshot
     1. The peak brightest day
     2. A high-activity day on a different row
     3. The latest active contribution day
@@ -31,6 +32,10 @@ def select_diverse_targets(active_days: List[Dict[str, Any]]) -> List[Dict[str, 
     peak = max(active_days, key=lambda x: x["count"])
     latest = by_date[-1]
 
+    # Check for newly detected commits
+    new_commits = [d for d in active_days if d.get("is_new")]
+    new_priority = new_commits[-1] if new_commits else None
+
     # Select candidate on a significantly different row than peak
     diff_row_candidates = [
         d for d in active_days
@@ -41,7 +46,7 @@ def select_diverse_targets(active_days: List[Dict[str, Any]]) -> List[Dict[str, 
     # Earlier cluster
     earlier = by_date[0] if (by_date[0]["col"] != peak["col"] or by_date[0]["row"] != peak["row"]) else None
 
-    pool = [c for c in [earlier, peak, diff_row, latest] if c is not None]
+    pool = [c for c in [new_priority, earlier, peak, diff_row, latest] if c is not None]
     unique_targets: List[Dict[str, Any]] = []
     for item in pool:
         if not any(t["col"] == item["col"] and t["row"] == item["row"] for t in unique_targets):
@@ -170,6 +175,11 @@ def build_timeline(
             sniff_x = t_cell_x - 26
         sniff_y = t_cell_y + CELL - 20
 
+        is_new = target.get("is_new", False)
+        sniff_status = f"NEW COMMIT: Sniffing fresh commit on {t_date}! ✦" if is_new else f"SNIFF: Discovered {t_date} · {t_count} contributions! ✦"
+        paw_status = f"NEW CODE: Verifying fresh commit on {t_date} 🐾" if is_new else "PAW TOUCH: Doggo verifying contribution square..."
+        stamp_status = f"APPROVED: Fresh commit verified on {t_date}! ⭐" if is_new else f"APPROVED: Verified {t_date}! Pawprint stamped."
+
         # Sniff (3 frames)
         for sf in range(3):
             timeline.append({
@@ -178,7 +188,7 @@ def build_timeline(
                 "facing_left": sniff_facing_left,
                 "state": "sniff",
                 "frame": sf,
-                "status": f"SNIFF: Discovered {t_date} · {t_count} contributions! ✦",
+                "status": sniff_status,
                 "target": target,
                 "paws": set(visited_paws),
                 "sparkle": True,
@@ -192,7 +202,7 @@ def build_timeline(
                 "facing_left": sniff_facing_left,
                 "state": "paw_touch",
                 "frame": pf,
-                "status": "PAW TOUCH: Doggo verifying contribution square...",
+                "status": paw_status,
                 "target": target,
                 "paws": set(visited_paws),
                 "sparkle": True,
@@ -209,7 +219,7 @@ def build_timeline(
                 "facing_left": sniff_facing_left,
                 "state": "happy",
                 "frame": hf,
-                "status": f"APPROVED: Verified {t_date}! Pawprint stamped.",
+                "status": stamp_status,
                 "target": target,
                 "paws": set(visited_paws),
                 "sparkle": False,
